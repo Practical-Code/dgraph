@@ -34,7 +34,7 @@ import (
 	otrace "go.opencensus.io/trace"
 
 	"github.com/dgraph-io/badger/v2/y"
-	"github.com/dgraph-io/dgo/v2/protos/api"
+	"github.com/dgraph-io/dgo/v200/protos/api"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/raftwal"
 	"github.com/dgraph-io/dgraph/x"
@@ -142,7 +142,7 @@ func NewNode(rc *pb.RaftContext, store *raftwal.DiskStorage) *Node {
 		peers:       make(map[uint64]string),
 		requestCh:   make(chan linReadReq, 100),
 	}
-	n.Applied.Init(nil, true)
+	n.Applied.Init(nil)
 	// This should match up to the Applied index set above.
 	n.Applied.SetDoneUntil(n.Cfg.Applied)
 	glog.Infof("Setting raft.Config to: %+v\n", n.Cfg)

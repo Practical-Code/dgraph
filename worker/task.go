@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/dgo/v2/protos/api"
+	"github.com/dgraph-io/dgo/v200/protos/api"
 	"github.com/dgraph-io/dgraph/algo"
 	"github.com/dgraph-io/dgraph/conn"
 	"github.com/dgraph-io/dgraph/posting"
@@ -38,6 +38,7 @@ import (
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/golang/glog"
 	otrace "go.opencensus.io/trace"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/golang/protobuf/proto"
 	cindex "github.com/google/codesearch/index"
@@ -364,7 +365,6 @@ func (qs *queryState) handleValuePostings(ctx context.Context, args funcArgs) er
 	x.AssertTrue(width > 0)
 	span.Annotatef(nil, "Width: %d. NumGo: %d", width, numGo)
 
-	errCh := make(chan error, numGo)
 	outputs := make([]*pb.Result, numGo)
 	listType := schema.State().IsList(q.Attr)
 
@@ -484,21 +484,21 @@ func (qs *queryState) handleValuePostings(ctx context.Context, args funcArgs) er
 		return nil
 	} // End of calculate function.
 
+	var g errgroup.Group
 	for i := 0; i < numGo; i++ {
 		start := i * width
 		end := start + width
 		if end > srcFn.n {
 			end = srcFn.n
 		}
-		go func(start, end int) {
-			errCh <- calculate(start, end)
-		}(start, end)
+		g.Go(func() error {
+			return calculate(start, end)
+		})
 	}
-	for i := 0; i < numGo; i++ {
-		if err := <-errCh; err != nil {
-			return err
-		}
+	if err := g.Wait(); err != nil {
+		return err
 	}
+
 	// All goroutines are done. Now attach their results.
 	out := args.out
 	for _, chunk := range outputs {
@@ -761,7 +761,7 @@ func (qs *queryState) handleUidPostings(
 				if i == 0 {
 					span.Annotate(nil, "UidInFn")
 				}
-				reqList := &pb.List{Uids: []uint64{srcFn.uidPresent}}
+				reqList := &pb.List{Uids: srcFn.uidsPresent}
 				topts := posting.ListOptions{
 					ReadTs:    args.q.ReadTs,
 					AfterUid:  0,
@@ -1220,7 +1220,7 @@ func (qs *queryState) handleCompareFunction(ctx context.Context, arg funcArgs) e
 				switch lang {
 				case "":
 					if isList {
-						pl, err := posting.GetNoStore(x.DataKey(attr, uid))
+						pl, err := posting.GetNoStore(x.DataKey(attr, uid), arg.q.ReadTs)
 						if err != nil {
 							filterErr = err
 							return false
@@ -1234,7 +1234,8 @@ func (qs *queryState) handleCompareFunction(ctx context.Context, arg funcArgs) e
 						}
 						for _, sv := range svs {
 							dst, err := types.Convert(sv, typ)
-							if err == nil && types.CompareVals(arg.q.SrcFunc.Name, dst, arg.srcFn.eqTokens[row]) {
+							if err == nil && types.CompareVals(arg.q.SrcFunc.Name, dst,
+								arg.srcFn.eqTokens[row]) {
 								return true
 							}
 						}
@@ -1242,7 +1243,7 @@ func (qs *queryState) handleCompareFunction(ctx context.Context, arg funcArgs) e
 						return false
 					}
 
-					pl, err := posting.GetNoStore(x.DataKey(attr, uid))
+					pl, err := posting.GetNoStore(x.DataKey(attr, uid), arg.q.ReadTs)
 					if err != nil {
 						filterErr = err
 						return false
@@ -1258,7 +1259,7 @@ func (qs *queryState) handleCompareFunction(ctx context.Context, arg funcArgs) e
 					return err == nil &&
 						types.CompareVals(arg.q.SrcFunc.Name, dst, arg.srcFn.eqTokens[row])
 				case ".":
-					pl, err := posting.GetNoStore(x.DataKey(attr, uid))
+					pl, err := posting.GetNoStore(x.DataKey(attr, uid), arg.q.ReadTs)
 					if err != nil {
 						filterErr = err
 						return false
@@ -1582,7 +1583,7 @@ type functionContext struct {
 	ineqValueToken string
 	n              int
 	threshold      int64
-	uidPresent     uint64
+	uidsPresent    []uint64
 	fname          string
 	fnType         FuncType
 	regex          *cregexp.Regexp
@@ -1815,17 +1816,25 @@ func parseSrcFn(ctx context.Context, q *pb.Query) (*functionContext, error) {
 		}
 		checkRoot(q, fc)
 	case uidInFn:
-		if err = ensureArgsCount(q.SrcFunc, 1); err != nil {
+		if len(q.SrcFunc.Args) == 0 {
+			err := errors.Errorf("Function '%s' requires atleast 1 argument, but got %d (%v)",
+				q.SrcFunc.Name, len(q.SrcFunc.Args), q.SrcFunc.Args)
 			return nil, err
 		}
-		fc.uidPresent, err = strconv.ParseUint(q.SrcFunc.Args[0], 0, 64)
-		if err != nil {
-			if e, ok := err.(*strconv.NumError); ok && e.Err == strconv.ErrSyntax {
-				return nil, errors.Errorf("Value %q in %s is not a number",
-					q.SrcFunc.Args[0], q.SrcFunc.Name)
+		for _, arg := range q.SrcFunc.Args {
+			uidParsed, err := strconv.ParseUint(arg, 0, 64)
+			if err != nil {
+				if e, ok := err.(*strconv.NumError); ok && e.Err == strconv.ErrSyntax {
+					return nil, errors.Errorf("Value %q in %s is not a number",
+						arg, q.SrcFunc.Name)
+				}
+				return nil, err
 			}
-			return nil, err
+			fc.uidsPresent = append(fc.uidsPresent, uidParsed)
 		}
+		sort.Slice(fc.uidsPresent, func(i, j int) bool {
+			return fc.uidsPresent[i] < fc.uidsPresent[j]
+		})
 		checkRoot(q, fc)
 		if fc.isFuncAtRoot {
 			return nil, errors.Errorf("uid_in function not allowed at root")

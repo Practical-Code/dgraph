@@ -19,6 +19,7 @@ package x
 import (
 	"errors"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/getsentry/sentry-go"
@@ -26,26 +27,62 @@ import (
 	"github.com/mitchellh/panicwrap"
 )
 
-var env string
+var (
+	env string
+	dsn string // API KEY to use
+)
+
+// Sentry API KEYs to use.
+const (
+	// dgraph-gh project (production/release builds).
+	dsnProd = "https://58a035f0d85a4c1c80aee0a3e72f3899@o318308.ingest.sentry.io/1805390"
+	// dgraph-devtest-playground project (dev builds).
+	dsnDevtest = "https://84c2ad450005436fa27d97ef72b52425@o318308.ingest.sentry.io/5208688"
+)
 
 // InitSentry initializes the sentry machinery.
 func InitSentry(ee bool) {
+	env = "prod-"
+	dsn = dsnProd
+	if DevVersion() {
+		dsn = dsnDevtest
+		env = "dev-"
+	}
 	if ee {
-		env = "enterprise"
+		env += "enterprise"
 	} else {
-		env = "oss"
+		env += "oss"
 	}
 	initSentry()
 }
 
 func initSentry() {
 	if err := sentry.Init(sentry.ClientOptions{
-		Dsn:              "https://58a035f0d85a4c1c80aee0a3e72f3899@sentry.io/1805390",
+		Dsn:              dsn,
 		Debug:            true,
 		AttachStacktrace: true,
 		ServerName:       WorkerConfig.MyAddr,
 		Environment:      env,
 		Release:          Version(),
+		BeforeSend: func(event *sentry.Event, hint *sentry.EventHint) *sentry.Event {
+			// Modify the event here before sending it to sentry server.
+			if len(event.Exception) == 0 {
+				return event
+			}
+			ex := &event.Exception[0]
+			// Filter out the stacktrace since it is of no use.
+			ex.RawStacktrace = nil
+			ex.Stacktrace = nil
+
+			// Set exception type to the panic message.
+			if strings.HasPrefix(event.Exception[0].Value, "panic") {
+				indexofNewline := strings.IndexByte(event.Exception[0].Value, '\n')
+				if indexofNewline != -1 {
+					ex.Type = ex.Value[:indexofNewline]
+				}
+			}
+			return event
+		},
 	}); err != nil {
 		glog.Fatalf("Sentry init failed: %v", err)
 	}
@@ -62,14 +99,6 @@ func ConfigureSentryScope(subcmd string) {
 		scope.SetTag("dgraph", subcmd)
 		scope.SetLevel(sentry.LevelFatal)
 	})
-}
-
-// Panic sends the error report to Sentry and then panics.
-func Panic(err error) {
-	if err != nil {
-		CaptureSentryException(err)
-		panic(err)
-	}
 }
 
 // CaptureSentryException sends the error report to Sentry.

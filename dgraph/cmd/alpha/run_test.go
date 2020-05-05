@@ -30,8 +30,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dgraph-io/dgo/v2"
-	"github.com/dgraph-io/dgo/v2/protos/api"
+	"github.com/dgraph-io/dgo/v200"
+	"github.com/dgraph-io/dgo/v200/protos/api"
 	"github.com/dgraph-io/dgraph/gql"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/query"
@@ -117,7 +117,7 @@ func alterSchemaInBackground(s string) error {
 func alterSchemaHelper(s string, bg bool) error {
 	url := addr + "/alter"
 	if bg {
-		url += "?run_in_background=true"
+		url += "?runInBackground=true"
 	}
 
 	_, _, err := runWithRetries("PUT", "", url, s)

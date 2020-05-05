@@ -1,8 +1,10 @@
 package admin
 
 import (
+	"context"
 	"fmt"
-	dgoapi "github.com/dgraph-io/dgo/v2/protos/api"
+
+	dgoapi "github.com/dgraph-io/dgo/v200/protos/api"
 	"github.com/dgraph-io/dgraph/gql"
 	"github.com/dgraph-io/dgraph/graphql/resolve"
 	"github.com/dgraph-io/dgraph/graphql/schema"
@@ -20,14 +22,16 @@ func NewUpdateGroupRewriter() resolve.MutationRewriter {
 // otherwise, it is created. It also ensures that only the last rule out of all
 // duplicate rules in input is preserved. A rule is duplicate if it has same predicate
 // name as another rule.
-func (urw *updateGroupRewriter) Rewrite(m schema.Mutation) (*gql.GraphQuery,
-	[]*dgoapi.Mutation, error) {
+func (urw *updateGroupRewriter) Rewrite(
+	ctx context.Context,
+	m schema.Mutation) (*resolve.UpsertMutation, error) {
+
 	inp := m.ArgValue(schema.InputArgName).(map[string]interface{})
 	setArg := inp["set"]
 	delArg := inp["remove"]
 
 	if setArg == nil && delArg == nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 
 	upsertQuery := resolve.RewriteUpsertQueryFromMutation(m)
@@ -35,7 +39,7 @@ func (urw *updateGroupRewriter) Rewrite(m schema.Mutation) (*gql.GraphQuery,
 
 	var errSet, errDel error
 	var mutSet, mutDel []*dgoapi.Mutation
-	varGen := resolve.VariableGenerator(0)
+	varGen := resolve.NewVariableGenerator()
 	ruleType := m.MutatedType().Field("rules").Type()
 
 	if setArg != nil {
@@ -46,7 +50,7 @@ func (urw *updateGroupRewriter) Rewrite(m schema.Mutation) (*gql.GraphQuery,
 		}
 		for _, ruleI := range rules {
 			rule := ruleI.(map[string]interface{})
-			variable := varGen.Next(ruleType)
+			variable := varGen.Next(ruleType, "", "")
 			predicate := rule["predicate"]
 			permission := rule["permission"]
 
@@ -92,7 +96,7 @@ func (urw *updateGroupRewriter) Rewrite(m schema.Mutation) (*gql.GraphQuery,
 				continue
 			}
 
-			variable := varGen.Next(ruleType)
+			variable := varGen.Next(ruleType, "", "")
 			addAclRuleQuery(upsertQuery, predicate.(string), variable)
 
 			deleteJson := []byte(fmt.Sprintf(`[
@@ -119,21 +123,23 @@ func (urw *updateGroupRewriter) Rewrite(m schema.Mutation) (*gql.GraphQuery,
 	// if there is no mutation being performed as a result of some specific input,
 	// then we don't need to do the upsertQuery for group
 	if len(mutSet) == 0 && len(mutDel) == 0 {
-		return nil, nil, nil
+		return nil, nil
 	}
 
-	return &gql.GraphQuery{Children: []*gql.GraphQuery{upsertQuery}},
-		append(mutSet, mutDel...),
-		schema.GQLWrapf(schema.AppendGQLErrs(errSet, errDel), "failed to rewrite mutation payload")
+	return &resolve.UpsertMutation{
+		Query:     &gql.GraphQuery{Children: []*gql.GraphQuery{upsertQuery}},
+		Mutations: append(mutSet, mutDel...),
+	}, schema.GQLWrapf(schema.AppendGQLErrs(errSet, errDel), "failed to rewrite mutation payload")
 }
 
 // FromMutationResult rewrites the query part of a GraphQL update mutation into a Dgraph query.
 func (urw *updateGroupRewriter) FromMutationResult(
+	ctx context.Context,
 	mutation schema.Mutation,
 	assigned map[string]string,
 	result map[string]interface{}) (*gql.GraphQuery, error) {
 
-	return ((*resolve.UpdateRewriter)(urw)).FromMutationResult(mutation, assigned, result)
+	return ((*resolve.UpdateRewriter)(urw)).FromMutationResult(ctx, mutation, assigned, result)
 }
 
 // addAclRuleQuery adds a *gql.GraphQuery to upsertQuery.Children to query a rule inside a group
