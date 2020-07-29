@@ -36,6 +36,7 @@ import (
 	"github.com/dgraph-io/badger/v2/y"
 	"github.com/dgraph-io/dgo/v2/protos/api"
 	"github.com/dgraph-io/dgraph/edgraph"
+	"github.com/dgraph-io/dgraph/ee/backup"
 	"github.com/dgraph-io/dgraph/ee/enc"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/schema"
@@ -106,6 +107,8 @@ they form a Raft group and provide synchronous replication.
 	flag.String("badger.vlog", "mmap",
 		"[mmap, disk] Specifies how Badger Value log is stored."+
 			" mmap consumes more RAM, but provides better performance.")
+	flag.Int("badger.compression_level", 3,
+		"The compression level for Badger. A higher value uses more resources.")
 	flag.String("encryption_key_file", "",
 		"The file that stores the encryption key. The key size must be 16, 24, or 32 bytes long. "+
 			"The key size determines the corresponding block size for AES encryption "+
@@ -121,7 +124,7 @@ they form a Raft group and provide synchronous replication.
 			" transaction is determined by its last mutation.")
 
 	// OpenCensus flags.
-	flag.Float64("trace", 1.0, "The ratio of queries to trace.")
+	flag.Float64("trace", 0.01, "The ratio of queries to trace.")
 	flag.String("jaeger.collector", "", "Send opencensus traces to Jaeger.")
 	// See https://github.com/DataDog/opencensus-go-exporter-datadog/issues/34
 	// about the status of supporting annotation logs through the datadog exporter
@@ -138,7 +141,7 @@ they form a Raft group and provide synchronous replication.
 	flag.String("my", "",
 		"IP_ADDRESS:PORT of this Dgraph Alpha, so other Dgraph Alphas can talk to this.")
 	flag.StringP("zero", "z", fmt.Sprintf("localhost:%d", x.PortZeroGrpc),
-		"IP_ADDRESS:PORT of a Dgraph Zero.")
+		"Comma separated list of Dgraph zero addresses of the form IP_ADDRESS:PORT.")
 	flag.Uint64("idx", 0,
 		"Optional Raft ID that this Dgraph Alpha will use to join RAFT groups.")
 	flag.Int("max_retries", -1,
@@ -509,9 +512,10 @@ func run() {
 	bindall = Alpha.Conf.GetBool("bindall")
 
 	opts := worker.Options{
-		BadgerTables:  Alpha.Conf.GetString("badger.tables"),
-		BadgerVlog:    Alpha.Conf.GetString("badger.vlog"),
-		BadgerKeyFile: Alpha.Conf.GetString("encryption_key_file"),
+		BadgerTables:           Alpha.Conf.GetString("badger.tables"),
+		BadgerVlog:             Alpha.Conf.GetString("badger.vlog"),
+		BadgerKeyFile:          Alpha.Conf.GetString("encryption_key_file"),
+		BadgerCompressionLevel: Alpha.Conf.GetInt("badger.compression_level"),
 
 		PostingDir: Alpha.Conf.GetString("postings"),
 		WALDir:     Alpha.Conf.GetString("wal"),
@@ -520,6 +524,7 @@ func run() {
 		AuthToken:      Alpha.Conf.GetString("auth_token"),
 		AllottedMemory: Alpha.Conf.GetFloat64("lru_mb"),
 	}
+	backup.BadgerKeyFile = opts.BadgerKeyFile
 
 	// OSS, non-nil key file --> crash
 	if !enc.EeBuild && opts.BadgerKeyFile != "" {
@@ -569,7 +574,7 @@ func run() {
 		NumPendingProposals: Alpha.Conf.GetInt("pending_proposals"),
 		Tracing:             Alpha.Conf.GetFloat64("trace"),
 		MyAddr:              Alpha.Conf.GetString("my"),
-		ZeroAddr:            Alpha.Conf.GetString("zero"),
+		ZeroAddr:            strings.Split(Alpha.Conf.GetString("zero"), ","),
 		RaftId:              cast.ToUint64(Alpha.Conf.GetString("idx")),
 		WhiteListedIPRanges: ips,
 		MaxRetries:          Alpha.Conf.GetInt("max_retries"),

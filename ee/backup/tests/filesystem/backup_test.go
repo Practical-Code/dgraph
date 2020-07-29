@@ -105,6 +105,12 @@ func TestBackupFilesystem(t *testing.T) {
 	_ = runBackup(t, 3, 1)
 	restored := runRestore(t, copyBackupDir, "", math.MaxUint64)
 
+	// Check the predicates and types in the schema are as expected.
+	// TODO: refactor tests so that minio and filesystem tests share most of their logic.
+	preds := []string{"dgraph.type", "movie"}
+	types := []string{"Node"}
+	testutil.CheckSchema(t, preds, types)
+
 	checks := []struct {
 		blank, expected string
 	}{
@@ -129,10 +135,27 @@ func TestBackupFilesystem(t *testing.T) {
 	t.Logf("%+v", incr1)
 	require.NoError(t, err)
 
+	// Update schema and types to make sure updates to the schema are backed up.
+	require.NoError(t, dg.Alter(ctx, &api.Operation{Schema: `
+		movie: string .
+		actor: string .
+		type Node {
+			movie
+		}
+		type NewNode {
+			actor
+		}`}))
+
 	// Perform first incremental backup.
 	_ = runBackup(t, 6, 2)
 	restored = runRestore(t, copyBackupDir, "", incr1.Txn.CommitTs)
 
+	// Check the predicates and types in the schema are as expected.
+	preds = append(preds, "actor")
+	types = append(types, "NewNode")
+	testutil.CheckSchema(t, preds, types)
+
+	// Perform some checks on the restored values.
 	checks = []struct {
 		blank, expected string
 	}{
@@ -156,6 +179,7 @@ func TestBackupFilesystem(t *testing.T) {
 	// Perform second incremental backup.
 	_ = runBackup(t, 9, 3)
 	restored = runRestore(t, copyBackupDir, "", incr2.Txn.CommitTs)
+	testutil.CheckSchema(t, preds, types)
 
 	checks = []struct {
 		blank, expected string
@@ -180,6 +204,7 @@ func TestBackupFilesystem(t *testing.T) {
 	// Perform second full backup.
 	dirs := runBackupInternal(t, true, 12, 4)
 	restored = runRestore(t, copyBackupDir, "", incr3.Txn.CommitTs)
+	testutil.CheckSchema(t, preds, types)
 
 	// Check all the values were restored to their most recent value.
 	checks = []struct {
@@ -252,7 +277,7 @@ func runRestore(t *testing.T, backupLocation, lastDir string, commitTs uint64) m
 	require.NoError(t, os.RemoveAll(restoreDir))
 
 	t.Logf("--- Restoring from: %q", backupLocation)
-	result := backup.RunRestore("./data/restore", backupLocation, lastDir)
+	result := backup.RunRestore("./data/restore", backupLocation, lastDir, "")
 	require.NoError(t, result.Err)
 
 	for i, pdir := range []string{"p1", "p2", "p3"} {
@@ -266,15 +291,6 @@ func runRestore(t *testing.T, backupLocation, lastDir string, commitTs uint64) m
 	restored, err := testutil.GetPredicateValues(pdir, "movie", commitTs)
 	require.NoError(t, err)
 	t.Logf("--- Restored values: %+v\n", restored)
-
-	restoredPreds, err := testutil.GetPredicateNames(pdir, commitTs)
-	require.NoError(t, err)
-	require.ElementsMatch(t, []string{"dgraph.type", "movie"}, restoredPreds)
-
-	restoredTypes, err := testutil.GetTypeNames(pdir, commitTs)
-	require.NoError(t, err)
-	require.ElementsMatch(t, []string{"Node"}, restoredTypes)
-
 	return restored
 }
 
@@ -284,7 +300,7 @@ func runFailingRestore(t *testing.T, backupLocation, lastDir string, commitTs ui
 	// calling restore.
 	require.NoError(t, os.RemoveAll(restoreDir))
 
-	result := backup.RunRestore("./data/restore", backupLocation, lastDir)
+	result := backup.RunRestore("./data/restore", backupLocation, lastDir, "")
 	require.Error(t, result.Err)
 	require.Contains(t, result.Err.Error(), "expected a BackupNum value of 1")
 }

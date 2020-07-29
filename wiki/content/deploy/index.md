@@ -283,7 +283,10 @@ can leave that flag empty, and Zero would auto-assign an id to the Alpha. This
 id would get persisted in the write-ahead log, so be careful not to delete it.
 
 The new Alphas will automatically detect each other by communicating with
-Dgraph zero and establish connections to each other.
+Dgraph zero and establish connections to each other. You can provide a list of
+zero addresses to alpha using the `--zero` flag. Alpha will try to connect to
+one of the zeros starting from the first zero address in the list. For example:
+`--zero=zero1,zero2,zero3` where zero1 is the `host:port` of a zero instance.
 
 Typically, Zero would first attempt to replicate a group, by assigning a new
 Dgraph alpha to run the same group as assigned to another. Once the group has
@@ -896,44 +899,61 @@ volumes:
 1. This setup assumes that you are using 6 hosts, but if you are running fewer than 6 hosts then you have to either use different volumes between Dgraph alphas or use `-p` & `-w` to configure data directories.
 2. This setup would create and use a local volume called `dgraph_data-volume` on the instances. If you plan to replace instances, you should use remote storage like [cloudstore](https://docs.docker.com/docker-for-aws/persistent-data-volumes) instead of local disk. {{% /notice %}}
 
-## Using Kubernetes (v1.8.4)
+## Using Kubernetes
 
-{{% notice "note" %}}These instructions are for running Dgraph Alpha without TLS config.
+The following section covers running Dgraph with Kubernetes.  We have tested Dgraph with Kubernetes 1.14 to 1.15 on [GKE](https://cloud.google.com/kubernetes-engine) and [EKS](https://aws.amazon.com/eks/).
+
+{{% notice "note" %}}These instructions are for running Dgraph Alpha without TLS configuration.
 Instructions for running with TLS refer [TLS instructions](#tls-configuration).{{% /notice %}}
 
 * Install [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/) which is used to deploy
   and manage applications on kubernetes.
-* Get the kubernetes cluster up and running on a cloud provider of your choice. You can use [kops](https://github.com/kubernetes/kops/blob/master/docs/aws.md) to set it up on AWS. Kops does auto-scaling by default on AWS and creates the volumes and instances for you.
+* Get the Kubernetes cluster up and running on a cloud provider of your choice.
+  * For Amazon [EKS](https://aws.amazon.com/eks/), you can use [eksctl](https://eksctl.io/) to quickly provision a new cluster. If you are new to this, Amazon has an article [Getting started with eksctl](https://docs.aws.amazon.com/eks/latest/userguide/getting-started-eksctl.html).
+  * For Google Cloud [GKE](https://cloud.google.com/kubernetes-engine), you can use [Google Cloud SDK](https://cloud.google.com/sdk/install) and the `gcloud container clusters create` command to quickly provision a new cluster.
 
-Verify that you have your cluster up and running using `kubectl get nodes`. If you used `kops` with
-the default options, you should have a master and two worker nodes ready.
+Verify that you have your cluster up and running using `kubectl get nodes`. If you used `eksctl` or `gcloud container clusters create` with the default options, you should have 2-3 worker nodes ready.
+
+On Amazon [EKS](https://aws.amazon.com/eks/), you would see something like this:
 
 ```sh
 ➜  kubernetes git:(master) ✗ kubectl get nodes
-NAME                                          STATUS    ROLES     AGE       VERSION
-ip-172-20-42-118.us-west-2.compute.internal   Ready     node      1h        v1.8.4
-ip-172-20-61-179.us-west-2.compute.internal   Ready     master    2h        v1.8.4
-ip-172-20-61-73.us-west-2.compute.internal    Ready     node      2h        v1.8.4
+NAME                                          STATUS   ROLES    AGE   VERSION
+<aws-ip-hostname>.<region>.compute.internal   Ready    <none>   1m   v1.15.11-eks-af3caf
+<aws-ip-hostname>.<region>.compute.internal   Ready    <none>   1m   v1.15.11-eks-af3caf
+```
+
+On Google Cloud [GKE](https://cloud.google.com/kubernetes-engine), you would see something like this:
+
+```sh
+➜  kubernetes git:(master) ✗ kubectl get nodes
+NAME                                       STATUS   ROLES    AGE   VERSION
+gke-<cluster-name>-default-pool-<gce-id>   Ready    <none>   41s   v1.14.10-gke.36
+gke-<cluster-name>-default-pool-<gce-id>   Ready    <none>   40s   v1.14.10-gke.36
+gke-<cluster-name>-default-pool-<gce-id>   Ready    <none>   41s   v1.14.10-gke.36
 ```
 
 ### Single Server
 
-Once your Kubernetes cluster is up, you can use [dgraph-single.yaml](https://github.com/dgraph-io/dgraph/blob/master/contrib/config/kubernetes/dgraph-single/dgraph-single.yaml) to start a Zero and Alpha.
+Once your Kubernetes cluster is up, you can use [dgraph-single.yaml](https://github.com/dgraph-io/dgraph/blob/master/contrib/config/kubernetes/dgraph-single/dgraph-single.yaml) to start a Zero, Alpha, and Ratel UI services.
 
-* From your machine, run the following command to start a StatefulSet that
-  creates a Pod with Zero and Alpha running in it.
+#### Deploy Single Server
+
+From your machine, run the following command to start a StatefulSet that creates a single Pod with Zero, Alpha, and Ratel UI running in it.
 
 ```sh
-kubectl create -f https://raw.githubusercontent.com/dgraph-io/dgraph/master/contrib/config/kubernetes/dgraph-single/dgraph-single.yaml
+kubectl create --filename https://raw.githubusercontent.com/dgraph-io/dgraph/master/contrib/config/kubernetes/dgraph-single/dgraph-single.yaml
 ```
 
 Output:
 ```
-service "dgraph-public" created
-statefulset "dgraph" created
+service/dgraph-public created
+statefulset.apps/dgraph created
 ```
 
-* Confirm that the pod was created successfully.
+#### Verify Single Server
+
+Confirm that the pod was created successfully.
 
 ```sh
 kubectl get pods
@@ -945,34 +965,30 @@ NAME       READY     STATUS    RESTARTS   AGE
 dgraph-0   3/3       Running   0          1m
 ```
 
-{{% notice "tip" %}}You can check the logs for the containers in the pod using `kubectl logs -f dgraph-0 <container_name>`. For example, try `kubectl logs -f dgraph-0 alpha` for server logs.{{% /notice %}}
+{{% notice "tip" %}}
+You can check the logs for the containers in the pod using
+`kubectl logs --follow dgraph-0 <container_name>`. For example, try
+`kubectl logs --follow dgraph-0 alpha` for server logs.
+{{% /notice %}}
 
-* Test the setup
+#### Test Single Server Setup
 
 Port forward from your local machine to the pod
 
 ```sh
-kubectl port-forward dgraph-0 8080
-kubectl port-forward dgraph-0 8000
+kubectl port-forward pod/dgraph-0 8080:8080
+kubectl port-forward pod/dgraph-0 8000:8000
 ```
 
 Go to `http://localhost:8000` and verify Dgraph is working as expected.
 
-{{% notice "note" %}} You can also access the service on its External IP address.{{% /notice %}}
-
-
-* Stop the cluster
+#### Remove Single Server Resources
 
 Delete all the resources
 
 ```sh
-kubectl delete pods,statefulsets,services,persistentvolumeclaims,persistentvolumes -l app=dgraph
-```
-
-Stop the cluster. If you used `kops` you can run the following command.
-
-```sh
-kops delete cluster ${NAME} --yes
+kubectl delete --filename https://raw.githubusercontent.com/dgraph-io/dgraph/master/contrib/config/kubernetes/dgraph-single/dgraph-single.yaml
+kubectl delete persistentvolumeclaims --selector app=dgraph
 ```
 
 ### HA Cluster Setup Using Kubernetes
@@ -981,45 +997,61 @@ This setup allows you to run 3 Dgraph Alphas and 3 Dgraph Zeros. We start Zero w
 3` flag, so all data would be replicated on 3 Alphas and form 1 alpha group.
 
 {{% notice "note" %}} Ideally you should have at least three worker nodes as part of your Kubernetes
-cluster so that each Dgraph Alpha runs on a separate node.{{% /notice %}}
+cluster so that each Dgraph Alpha runs on a separate worker node.{{% /notice %}}
 
-* Check the nodes that are part of the Kubernetes cluster.
+#### Validate Kubernetes Cluster for HA
+
+Check the nodes that are part of the Kubernetes cluster.
 
 ```sh
 kubectl get nodes
 ```
 
-Output:
+Output for Amazon [EKS](https://aws.amazon.com/eks/):
+
 ```sh
-NAME                                          STATUS    ROLES     AGE       VERSION
-ip-172-20-34-90.us-west-2.compute.internal    Ready     master    6m        v1.8.4
-ip-172-20-51-1.us-west-2.compute.internal     Ready     node      4m        v1.8.4
-ip-172-20-59-116.us-west-2.compute.internal   Ready     node      4m        v1.8.4
-ip-172-20-61-88.us-west-2.compute.internal    Ready     node      5m        v1.8.4
+NAME                                          STATUS   ROLES    AGE   VERSION
+<aws-ip-hostname>.<region>.compute.internal   Ready    <none>   1m   v1.15.11-eks-af3caf
+<aws-ip-hostname>.<region>.compute.internal   Ready    <none>   1m   v1.15.11-eks-af3caf
+<aws-ip-hostname>.<region>.compute.internal   Ready    <none>   1m   v1.15.11-eks-af3caf
+```
+
+Output for Google Cloud [GKE](https://cloud.google.com/kubernetes-engine)
+
+```sh
+NAME                                       STATUS   ROLES    AGE   VERSION
+gke-<cluster-name>-default-pool-<gce-id>   Ready    <none>   41s   v1.14.10-gke.36
+gke-<cluster-name>-default-pool-<gce-id>   Ready    <none>   40s   v1.14.10-gke.36
+gke-<cluster-name>-default-pool-<gce-id>   Ready    <none>   41s   v1.14.10-gke.36
 ```
 
 Once your Kubernetes cluster is up, you can use [dgraph-ha.yaml](https://github.com/dgraph-io/dgraph/blob/master/contrib/config/kubernetes/dgraph-ha/dgraph-ha.yaml) to start the cluster.
 
-* From your machine, run the following command to start the cluster.
+#### Deploy Dgraph HA Cluster
+
+From your machine, run the following command to start the cluster.
 
 ```sh
-kubectl create -f https://raw.githubusercontent.com/dgraph-io/dgraph/master/contrib/config/kubernetes/dgraph-ha/dgraph-ha.yaml
+kubectl create --filename https://raw.githubusercontent.com/dgraph-io/dgraph/master/contrib/config/kubernetes/dgraph-ha/dgraph-ha.yaml
 ```
 
 Output:
 ```sh
-service "dgraph-zero-public" created
-service "dgraph-alpha-public" created
-service "dgraph-alpha-0-http-public" created
-service "dgraph-ratel-public" created
-service "dgraph-zero" created
-service "dgraph-alpha" created
-statefulset "dgraph-zero" created
-statefulset "dgraph-alpha" created
-deployment "dgraph-ratel" created
+service/dgraph-zero-public created
+service/dgraph-alpha-public created
+service/dgraph-ratel-public created
+service/dgraph-zero created
+service/dgraph-alpha created
+statefulset.apps/dgraph-zero created
+statefulset.apps/dgraph-alpha created
+deployment.apps/dgraph-ratel created
 ```
 
-* Confirm that the pods were created successfully.
+#### Verify Dgraph HA Cluster
+
+Confirm that the pods were created successfully.
+
+It may take a few minutes for the pods to come up.
 
 ```sh
 kubectl get pods
@@ -1027,47 +1059,261 @@ kubectl get pods
 
 Output:
 ```sh
-NAME                   READY     STATUS    RESTARTS   AGE
-dgraph-ratel-<pod-id>  1/1       Running   0          9s
-dgraph-alpha-0         1/1       Running   0          2m
-dgraph-alpha-1         1/1       Running   0          2m
-dgraph-alpha-2         1/1       Running   0          2m
-dgraph-zero-0          1/1       Running   0          2m
-dgraph-zero-1          1/1       Running   0          2m
-dgraph-zero-2          1/1       Running   0          2m
-
+NAME                  READY   STATUS    RESTARTS   AGE
+dgraph-alpha-0        1/1     Running   0          6m24s
+dgraph-alpha-1        1/1     Running   0          5m42s
+dgraph-alpha-2        1/1     Running   0          5m2s
+dgraph-ratel-<pod-id> 1/1     Running   0          6m23s
+dgraph-zero-0         1/1     Running   0          6m24s
+dgraph-zero-1         1/1     Running   0          5m41s
+dgraph-zero-2         1/1     Running   0          5m6s
 ```
 
-{{% notice "tip" %}}You can check the logs for the containers in the pod using `kubectl logs -f dgraph-alpha-0` and `kubectl logs -f dgraph-zero-0`.{{% /notice %}}
 
-* Test the setup
+{{% notice "tip" %}}You can check the logs for the containers in the pod using `kubectl logs --follow dgraph-alpha-0` and `kubectl logs --follow dgraph-zero-0`.{{% /notice %}}
+
+#### Test Dgraph HA Cluster Setup
 
 Port forward from your local machine to the pod
 
 ```sh
-kubectl port-forward dgraph-alpha-0 8080
-kubectl port-forward dgraph-ratel-<pod-id> 8000
+kubectl port-forward service/dgraph-alpha-public 8080:8080
+kubectl port-forward service/dgraph-ratel-public 8000:8000
 ```
 
 Go to `http://localhost:8000` and verify Dgraph is working as expected.
 
 {{% notice "note" %}} You can also access the service on its External IP address.{{% /notice %}}
 
-
-* Stop the cluster
+#### Delete Dgraph HA Cluster Resources
 
 Delete all the resources
 
 ```sh
-kubectl delete pods,statefulsets,services,persistentvolumeclaims,persistentvolumes -l app=dgraph-zero
-kubectl delete pods,statefulsets,services,persistentvolumeclaims,persistentvolumes -l app=dgraph-alpha
-kubectl delete pods,replicasets,services,persistentvolumeclaims,persistentvolumes -l app=dgraph-ratel
+kubectl delete --filename https://raw.githubusercontent.com/dgraph-io/dgraph/master/contrib/config/kubernetes/dgraph-ha/dgraph-ha.yaml
+kubectl delete persistentvolumeclaims --selector app=dgraph-zero
+kubectl delete persistentvolumeclaims --selector app=dgraph-alpha
 ```
 
-Stop the cluster. If you used `kops` you can run the following command.
+### Using Helm Chart
+
+Once your Kubernetes cluster is up, you can make use of the Helm chart present
+[in our official helm repository here](https://github.com/dgraph-io/charts/) to bring
+up a Dgraph cluster.
+
+{{% notice "note" %}}The instructions below are for Helm versions >= 3.x.{{% /notice %}}
+
+#### Installing the Chart
+
+To add the Dgraph helm repository:
 
 ```sh
-kops delete cluster ${NAME} --yes
+helm repo add dgraph https://charts.dgraph.io
+```
+
+To install the chart with the release name `my-release`:
+
+```sh
+helm install my-release dgraph/dgraph
+```
+
+The above command will install the latest available dgraph docker image. In order to install the older versions:
+
+```sh
+helm install my-release dgraph/dgraph --set image.tag="latest"
+```
+
+By default zero and alpha services are exposed only within the kubernetes cluster as
+kubernetes service type `ClusterIP`. In order to expose the alpha service publicly
+you can use kubernetes service type `LoadBalancer`:
+
+```sh
+helm install my-release dgraph/dgraph --set alpha.service.type="LoadBalancer"
+```
+
+Similarly, you can expose alpha and ratel service to the internet as follows:
+
+```sh
+helm install my-release dgraph/dgraph --set alpha.service.type="LoadBalancer" --set ratel.service.type="LoadBalancer"
+```
+
+#### Upgrading the Chart
+
+You can update your cluster configuration by updating the configuration of the
+Helm chart. Dgraph is a stateful database that requires some attention on
+upgrading the configuration carefully in order to update your cluster to your
+desired configuration.
+
+In general, you can use [`helm upgrade`][helm-upgrade] to update the
+configuration values of the cluster. Depending on your change, you may need to
+upgrade the configuration in multiple steps following the steps below.
+
+[helm-upgrade]: https://helm.sh/docs/helm/helm_upgrade/
+
+**Upgrade to HA cluster setup**
+
+To upgrade to an [HA cluster setup]({{< relref "#ha-cluster-setup" >}}), ensure
+that the shard replication setting is more than 1. When `zero.shardReplicaCount`
+is not set to an HA configuration (3 or 5), follow the steps below:
+
+1. Set the shard replica flag on the Zero node group. For example: `zero.shardReplicaCount=3`.
+2. Next, run the Helm upgrade command to restart the Zero node group:
+   ```sh
+   helm upgrade my-release dgraph/dgraph [options]
+   ```
+3. Now set the Alpha replica count flag. For example: `alpha.replicaCount=3`.
+4. Finally, run the Helm upgrade command again:
+   ```sh
+   helm upgrade my-release dgraph/dgraph [options]
+   ```
+
+
+#### Deleting the Chart
+
+Delete the Helm deployment as normal
+
+```sh
+helm delete my-release
+```
+Deletion of the StatefulSet doesn't cascade to deleting associated PVCs. To delete them:
+
+```sh
+kubectl delete pvc -l release=my-release,chart=dgraph
+```
+
+#### Configuration
+
+The following table lists the configurable parameters of the dgraph chart and their default values.
+
+|              Parameter               |                             Description                             |                       Default                       |
+| ------------------------------------ | ------------------------------------------------------------------- | --------------------------------------------------- |
+| `image.registry`                     | Container registry name                                             | `docker.io`                                         |
+| `image.repository`                   | Container image name                                                | `dgraph/dgraph`                                     |
+| `image.tag`                          | Container image tag                                                 | `latest`                                            |
+| `image.pullPolicy`                   | Container pull policy                                               | `Always`                                            |
+| `zero.name`                          | Zero component name                                                 | `zero`                                              |
+| `zero.updateStrategy`                | Strategy for upgrading zero nodes                                   | `RollingUpdate`                                     |
+| `zero.monitorLabel`                  | Monitor label for zero, used by prometheus.                         | `zero-dgraph-io`                                    |
+| `zero.rollingUpdatePartition`        | Partition update strategy                                           | `nil`                                               |
+| `zero.podManagementPolicy`           | Pod management policy for zero nodes                                | `OrderedReady`                                      |
+| `zero.replicaCount`                  | Number of zero nodes                                                | `3`                                                 |
+| `zero.shardReplicaCount`             | Max number of replicas per data shard                               | `5`                                                 |
+| `zero.terminationGracePeriodSeconds` | Zero server pod termination grace period                            | `60`                                                |
+| `zero.antiAffinity`                  | Zero anti-affinity policy                                           | `soft`                                              |
+| `zero.podAntiAffinitytopologyKey`    | Anti affinity topology key for zero nodes                           | `kubernetes.io/hostname`                            |
+| `zero.nodeAffinity`                  | Zero node affinity policy                                           | `{}`                                                |
+| `zero.service.type`                  | Zero node service type                                              | `ClusterIP`                                         |
+| `zero.securityContext.enabled`       | Security context for zero nodes enabled                             | `false`                                             |
+| `zero.securityContext.fsGroup`       | Group id of the zero container                                      | `1001`                                              |
+| `zero.securityContext.runAsUser`     | User ID for the zero container                                      | `1001`                                              |
+| `zero.persistence.enabled`           | Enable persistence for zero using PVC                               | `true`                                              |
+| `zero.persistence.storageClass`      | PVC Storage Class for zero volume                                   | `nil`                                               |
+| `zero.persistence.accessModes`       | PVC Access Mode for zero volume                                     | `ReadWriteOnce`                                     |
+| `zero.persistence.size`              | PVC Storage Request for zero volume                                 | `8Gi`                                               |
+| `zero.nodeSelector`                  | Node labels for zero pod assignment                                 | `{}`                                                |
+| `zero.tolerations`                   | Zero tolerations                                                    | `[]`                                                |
+| `zero.resources`                     | Zero node resources requests & limits                               | `{}`                                                |
+| `zero.livenessProbe`                 | Zero liveness probes                                                | `See values.yaml for defaults`                      |
+| `zero.readinessProbe`                | Zero readiness probes                                               | `See values.yaml for defaults`                      |
+| `alpha.name`                         | Alpha component name                                                | `alpha`                                             |
+| `alpha.updateStrategy`               | Strategy for upgrading alpha nodes                                  | `RollingUpdate`                                     |
+| `alpha.monitorLabel`                 | Monitor label for alpha, used by prometheus.                        | `alpha-dgraph-io`                                   |
+| `alpha.rollingUpdatePartition`       | Partition update strategy                                           | `nil`                                               |
+| `alpha.podManagementPolicy`          | Pod management policy for alpha nodes                               | `OrderedReady`                                      |
+| `alpha.replicaCount`                 | Number of alpha nodes                                               | `3`                                                 |
+| `alpha.terminationGracePeriodSeconds`| Alpha server pod termination grace period                           | `60`                                                |
+| `alpha.antiAffinity`                 | Alpha anti-affinity policy                                          | `soft`                                              |
+| `alpha.podAntiAffinitytopologyKey`   | Anti affinity topology key for zero nodes                           | `kubernetes.io/hostname`                            |
+| `alpha.nodeAffinity`                 | Alpha node affinity policy                                          | `{}`                                                |
+| `alpha.service.type`                 | Alpha node service type                                             | `ClusterIP`                                         |
+| `alpha.securityContext.enabled`      | Security context for alpha nodes enabled                            | `false`                                             |
+| `alpha.securityContext.fsGroup`      | Group id of the alpha container                                     | `1001`                                              |
+| `alpha.securityContext.runAsUser`    | User ID for the alpha container                                     | `1001`                                              |
+| `alpha.persistence.enabled`          | Enable persistence for alpha using PVC                              | `true`                                              |
+| `alpha.persistence.storageClass`     | PVC Storage Class for alpha volume                                  | `nil`                                               |
+| `alpha.persistence.accessModes`      | PVC Access Mode for alpha volume                                    | `ReadWriteOnce`                                     |
+| `alpha.persistence.size`             | PVC Storage Request for alpha volume                                | `8Gi`                                               |
+| `alpha.nodeSelector`                 | Node labels for alpha pod assignment                                | `{}`                                                |
+| `alpha.tolerations`                  | Alpha tolerations                                                   | `[]`                                                |
+| `alpha.resources`                    | Alpha node resources requests & limits                              | `{}`                                                |
+| `alpha.livenessProbe`                | Alpha liveness probes                                               | `See values.yaml for defaults`                      |
+| `alpha.readinessProbe`               | Alpha readiness probes                                              | `See values.yaml for defaults`                      |
+| `ratel.name`                         | Ratel component name                                                | `ratel`                                             |
+| `ratel.replicaCount`                 | Number of ratel nodes                                               | `1`                                                 |
+| `ratel.service.type`                 | Ratel service type                                                  | `ClusterIP`                                         |
+| `ratel.securityContext.enabled`      | Security context for ratel nodes enabled                            | `false`                                             |
+| `ratel.securityContext.fsGroup`      | Group id of the ratel container                                     | `1001`                                              |
+| `ratel.securityContext.runAsUser`    | User ID for the ratel container                                     | `1001`                                              |
+| `ratel.livenessProbe`                | Ratel liveness probes                                               | `See values.yaml for defaults`                      |
+| `ratel.readinessProbe`               | Ratel readiness probes                                              | `See values.yaml for defaults`                      |
+
+### Monitoring in Kubernetes
+
+Dgraph exposes prometheus metrics to monitor the state of various components involved in the cluster, this includes dgraph alpha and zero.
+
+Follow the below mentioned steps to setup prometheus monitoring for your cluster:
+
+* Install Prometheus operator:
+
+```sh
+kubectl apply -f https://raw.githubusercontent.com/coreos/prometheus-operator/release-0.34/bundle.yaml
+```
+
+* Ensure that the instance of `prometheus-operator` has started before continuing.
+
+```sh
+$ kubectl get deployments prometheus-operator
+NAME                  DESIRED   CURRENT   UP-TO-DATE   AVAILABLE   AGE
+prometheus-operator   1         1         1            1           3m
+```
+
+* Apply prometheus manifest present [here](https://github.com/dgraph-io/dgraph/blob/master/contrib/config/monitoring/prometheus/prometheus.yaml).
+
+```sh
+$ kubectl apply -f prometheus.yaml
+
+serviceaccount/prometheus-dgraph-io created
+clusterrole.rbac.authorization.k8s.io/prometheus-dgraph-io created
+clusterrolebinding.rbac.authorization.k8s.io/prometheus-dgraph-io created
+servicemonitor.monitoring.coreos.com/alpha.dgraph-io created
+servicemonitor.monitoring.coreos.com/zero-dgraph-io created
+prometheus.monitoring.coreos.com/dgraph-io created
+```
+
+To view prometheus UI locally run:
+
+```sh
+kubectl port-forward prometheus-dgraph-io-0 9090:9090
+```
+
+The UI is accessible at port 9090. Open http://localhost:9090 in your browser to play around.
+
+To register alerts from dgraph cluster with your prometheus deployment follow the steps below:
+
+* Create a kubernetes secret containing alertmanager configuration. Edit the configuration file present [here](https://github.com/dgraph-io/dgraph/blob/master/contrib/config/monitoring/prometheus/alertmanager-config.yaml)
+with the required reciever configuration including the slack webhook credential and create the secret.
+
+You can find more information about alertmanager configuration [here](https://prometheus.io/docs/alerting/configuration/).
+
+```sh
+$ kubectl create secret generic alertmanager-alertmanager-dgraph-io --from-file=alertmanager.yaml=alertmanager-config.yaml
+
+$ kubectl get secrets
+NAME                                            TYPE                 DATA   AGE
+alertmanager-alertmanager-dgraph-io             Opaque               1      87m
+```
+
+* Apply the [alertmanager](https://github.com/dgraph-io/dgraph/blob/master/contrib/config/monitoring/prometheus/alertmanager.yaml) along with [alert-rules](https://github.com/dgraph-io/dgraph/blob/master/contrib/config/monitoring/prometheus/alert-rules.yaml) manifest
+to use the default configured alert configuration. You can also add custom rules based on the metrics exposed by dgraph cluster similar to [alert-rules](https://github.com/dgraph-io/dgraph/blob/master/contrib/config/monitoring/prometheus/alert-rules.yaml)
+manifest.
+
+```sh
+$ kubectl apply -f alertmanager.yaml
+alertmanager.monitoring.coreos.com/alertmanager-dgraph-io created
+service/alertmanager-dgraph-io created
+
+$ kubectl apply -f alert-rules.yaml
+prometheusrule.monitoring.coreos.com/prometheus-rules-dgraph-io created
 ```
 
 ### Kubernetes Storage
@@ -1431,9 +1677,9 @@ Connections between client and server can be secured with TLS. Password protecte
 
 {{% notice "tip" %}}If you're generating encrypted private keys with `openssl`, be sure to specify encryption algorithm explicitly (like `-aes256`). This will force `openssl` to include `DEK-Info` header in private key, which is required to decrypt the key by Dgraph. When default encryption is used, `openssl` doesn't write that header and key can't be decrypted.{{% /notice %}}
 
-### Self-signed certificates
+### Dgraph Certificate Management Tool
 
-The `dgraph cert` program creates and manages self-signed certificates using a generated Dgraph Root CA. The _cert_ command simplifies certificate management for you.
+The `dgraph cert` program creates and manages CA-signed certificates and private keys using a generated Dgraph Root CA. The `dgraph cert` command simplifies certificate management for you.
 
 ```sh
 # To see the available flags.
@@ -1442,20 +1688,20 @@ $ dgraph cert --help
 # Create Dgraph Root CA, used to sign all other certificates.
 $ dgraph cert
 
-# Create node certificate (needed for Dgraph Live Loader using TLS)
-$ dgraph cert -n live
+# Create node certificate and private key
+$ dgraph cert -n localhost
 
-# Create client certificate
+# Create client certificate and private key for mTLS (mutual TLS)
 $ dgraph cert -c dgraphuser
 
 # Combine all in one command
-$ dgraph cert -n live -c dgraphuser
+$ dgraph cert -n localhost -c dgraphuser
 
 # List all your certificates and keys
 $ dgraph cert ls
 ```
 
-### File naming conventions
+#### File naming conventions
 
 To enable TLS you must specify the directory path to find certificates and keys. The default location where the _cert_ command stores certificates (and keys) is `tls` under the Dgraph working directory; where the data files are found. The default dir path can be overridden using the `--dir` option.
 
@@ -1488,7 +1734,7 @@ $ dgraph cert -n localhost,104.25.165.23,dgraph.io,2400:cb00:2048:1::6819:a417
 
 {{% notice "note" %}}When using host names for node certificates, including _localhost_, your clients must connect to the matching host name -- such as _localhost_ not 127.0.0.1. If you need to use IP addresses, then add them to the node certificate.{{% /notice %}}
 
-### Certificate inspection
+#### Certificate inspection
 
 The command `dgraph cert ls` lists all certificates and keys in the `--dir` directory (default 'tls'), along with details to inspect and validate cert/key pairs.
 
@@ -1537,43 +1783,75 @@ Important points:
 * Node certificates are only valid for the hosts listed.
 * Client certificates are only valid for the named client/user.
 
-### TLS options
+### TLS Options
 
 The following configuration options are available for Alpha:
 
 * `--tls_dir string` - TLS dir path; this enables TLS connections (usually 'tls').
 * `--tls_use_system_ca` - Include System CA with Dgraph Root CA.
-* `--tls_client_auth string` - TLS client authentication used to validate client connection. See [Client authentication](#client-authentication) for details.
+* `--tls_client_auth string` - TLS client authentication used to validate client connection. See [Client Authentication Options](#client-authentication-options) for details.
+
+Dgraph Live Loader can be configured with the following options:
+
+* `--tls_cacert string` - Dgraph Root CA, such as `./tls/ca.crt`
+* `--tls_use_system_ca` - Include System CA with Dgraph Root CA.
+* `--tls_cert` - User cert file provided by the client to Alpha
+* `--tls_key` - User private key file provided by the client to Alpha
+* `--tls_server_name string` - Server name, used for validating the server's TLS host name.
+
+
+#### Using TLS without Client Authentication
+
+For TLS without client authentication, you can configure certificates and run Alpha server using the following:
 
 ```sh
-# Default use for enabling TLS server (after generating certificates)
+# First, create rootca and node certificates and private keys
+$ dgraph cert -n localhost
+# Default use for enabling TLS server (after generating certificates and private keys)
 $ dgraph alpha --tls_dir tls
 ```
 
-Dgraph Live Loader can be configured with following options:
-
-* `--tls_dir string` - TLS dir path; this enables TLS connections (usually 'tls').
-* `--tls_use_system_ca` - Include System CA with Dgraph Root CA.
-* `--tls_server_name string` - Server name, used for validating the server's TLS host name.
+You can then run Dgraph live loader using the following:
 
 ```sh
-# First, create a client certificate for live loader. This will create 'tls/client.live.crt'
-$ dgraph cert -c live
-
 # Now, connect to server using TLS
-$ dgraph live --tls_dir tls -s 21million.schema -f 21million.rdf.gz
+$ dgraph live --tls_cacert ./tls/ca.crt --tls_server_name "localhost" -s 21million.schema -f 21million.rdf.gz
 ```
 
-### Client authentication
+#### Using TLS with Client Authentication
 
-The server option `--tls_client_auth` accepts different values that change the security policty of client certificate verification.
+If you do require Client Authentication (Mutual TLS), you can configure certificates and run Alpha server using the following:
 
-| Value | Description |
-|-------|-------------|
-| REQUEST | Server accepts any certificate, invalid and unverified (least secure) |
-| REQUIREANY | Server expects any certificate, valid and unverified |
-| VERIFYIFGIVEN | Client certificate is verified if provided (default) |
-| REQUIREANDVERIFY | Always require a valid certificate (most secure) |
+```sh
+# First, create a rootca, node, and client certificates and private keys
+$ dgraph cert -n localhost -c dgraphuser
+# Default use for enabling TLS server with client authentication (after generating certificates and private keys)
+$ dgraph alpha --tls_dir tls --tls_client_auth="REQUIREANDVERIFY"
+```
+
+You can then run Dgraph live loader using the following:
+
+```sh
+# Now, connect to server using mTLS (mutual TLS)
+$ dgraph live \
+   --tls_cacert ./tls/ca.crt \
+   --tls_cert ./tls/client.dgraphuser.crt \
+   --tls_key ./tls/client.dgraphuser.key \
+   --tls_server_name "localhost" \
+   -s 21million.schema \
+   -f 21million.rdf.gz
+```
+
+#### Client Authentication Options
+
+The server will always **request** Client Authentication.  There are four different values for the `--tls_client_auth` option that change the security policy of the client certificate.
+
+| Value              | Client Cert/Key | Client Certificate Verified |
+|--------------------|-----------------|--------------------|
+| `REQUEST`          | optional        | Client certificate is not VERIFIED if provided. (least secure) |
+| `REQUIREANY`       | required        | Client certificate is never VERIFIED |
+| `VERIFYIFGIVEN`    | optional        | Client certificate is VERIFIED if provided (default) |
+| `REQUIREANDVERIFY` | required        | Client certificate is always VERIFIED (most secure) |
 
 {{% notice "note" %}}REQUIREANDVERIFY is the most secure but also the most difficult to configure for remote clients. When using this value, the value of `--tls_server_name` is matched against the certificate SANs values and the connection host.{{% /notice %}}
 
@@ -1605,21 +1883,21 @@ succeed.
 
 ### Using Curl with Client authentication
 
-When TLS is enabled, `curl` requests to Dgraph will need some specific options to work.
-
-If the `--tls_client_auth` option is set to `REQUEST`or `VERIFYIFGIVEN` (default),
-use the option `--cacert`. For instance (for an export request):
+When TLS is enabled, `curl` requests to Dgraph will need some specific options to work.  For instance (for an export request):
 
 ```
-curl --cacert ./tls/ca.crt https://localhost:8080/admin/export
+curl --silent --cacert ./tls/ca.crt https://localhost:8080/admin/export
 ```
 
-If the `--tls_client_auth` option is set to  `REQUIREANY` or  `REQUIREANDVERIFY`,
-in addition to the `--cacert` option, also use the `--cert` and `--key` options.
-For instance (for an export request):
+If you are using `curl` with [Client Authentication](#client-authentication-options) set to `REQUIREANY` or `REQUIREANDVERIFY`, you will need to provide the client certificate and private key.  For instance (for an export request):
 
+<<<<<<< HEAD
 ``` 
 curl --cacert ./tls/ca.crt --cert ./tls/node.crt --key ./tls/node.key https://localhost:8080/admin/export
+=======
+```
+curl --silent --cacert ./tls/ca.crt --cert ./tls/client.dgraphuser.crt --key ./tls/client.dgraphuser.key https://localhost:8080/admin/export
+>>>>>>> cd454e58a... mTLS/TLS documentation fixes (#5382)
 ```
 
 Refer to the `curl` documentation for further information on its TLS options.
@@ -1698,6 +1976,17 @@ $ dgraph live -C -f <path-to-gzipped-RDF-or-JSON-file>
 # Read RDFs and a schema file and send to Dgraph running at given address.
 $ dgraph live -f <path-to-gzipped-RDf-or-JSON-file> -s <path-to-schema-file> -a <dgraph-alpha-address:grpc_port> -z <dgraph-zero-address:grpc_port>
 ```
+
+#### Encrypted imports via Live Loader
+
+A new flag keyfile is added to the Live Loader. This option is required to decrypt the encrypted export data and schema files. Once the export files are decrypted, the Live Loader streams the data to a live Alpha instance.
+
+{{% notice "note" %}}
+If the live Alpha instance has encryption turned on, the `p` directory will be encrypted. Otherwise, the `p` directory is unencrypted.
+{{% /notice %}}
+
+#### Encrypted RDF/JSON file and schema via Live Loader
+`dgraph live -f <path-to-encrypted-gzipped-RDF-or-JSON-file> -s <path-to-encrypted-schema> -keyfile <path-to-keyfile-to-decrypt-files>`
 
 #### Other Live Loader options
 
@@ -1858,6 +2147,40 @@ $ dgraph bulk -f <file1.rdf, file2.rdf> ...
 
 ```
 
+#### Encryption at rest with Bulk Loader
+
+Even before the Dgraph cluster starts, we can load data using Bulk Loader with the encryption feature turned on. Later we can point the generated `p` directory to a new Alpha server.
+
+Here's an example to run Bulk Loader with a key used to write encrypted data:
+
+```bash
+dgraph bulk --encryption_key_file ./enc_key_file -f data.json.gz -s data.schema --map_shards=1 --reduce_shards=1 --http localhost:8000 --zero=localhost:5080
+```
+
+#### Encrypting imports via Bulk Loader
+
+The Bulk Loader’s `encryption_key_file` option was previously used to encrypt the output `p ` directory. This same option will also be used to decrypt the encrypted export data and schema files.
+
+Another option, `--encrypted`, indicates whether the input `rdf`/`json` data and schema files are encrypted or not. With this switch, we support the use case of migrating data from unencrypted exports to encrypted import.
+
+So, with the above two options we have 4 cases:
+
+1. `--encrypted=true` and no `encryption_key_file`.
+
+Error: If the input is encrypted, a key file must be provided.
+
+2. `--encrypted=true` and `encryption_key_file`=`path to key.
+
+Input is encrypted and output `p` dir is encrypted as well.
+
+3. `--encrypted=false` and no `encryption_key_file`.
+
+Input is not encrypted and the output `p` dir is also not encrypted.   
+
+4. `--encrypted=false` and `encryption_key_file`=`path to key`.
+
+Input is not encrypted but the output is encrypted. (This is the migration use case mentioned above).
+
 #### Other Bulk Loader options
 
 `--new_uids` (default: false): Assign new UIDs instead of using the existing
@@ -1948,15 +2271,15 @@ The disk metrics let you track the disk activity of the Dgraph process. Dgraph d
 directly with the filesystem. Instead it relies on [Badger](https://github.com/dgraph-io/badger) to
 read from and write to disk.
 
- Metrics                          | Description
- -------                          | -----------
- `badger_disk_reads_total`        | Total count of disk reads in Badger.
- `badger_disk_writes_total`       | Total count of disk writes in Badger.
- `badger_gets_total`              | Total count of calls to Badger's `get`.
- `badger_memtable_gets_total`     | Total count of memtable accesses to Badger's `get`.
- `badger_puts_total`              | Total count of calls to Badger's `put`.
- `badger_read_bytes`              | Total bytes read from Badger.
- `badger_written_bytes`           | Total bytes written to Badger.
+ Metrics                          	 | Description
+ -------                          	 | -----------
+ `badger_v2_disk_reads_total`        | Total count of disk reads in Badger.
+ `badger_v2_disk_writes_total`       | Total count of disk writes in Badger.
+ `badger_v2_gets_total`              | Total count of calls to Badger's `get`.
+ `badger_v2_memtable_gets_total`     | Total count of memtable accesses to Badger's `get`.
+ `badger_v2_puts_total`              | Total count of calls to Badger's `put`.
+ `badger_v2_read_bytes`              | Total bytes read from Badger.
+ `badger_v2_written_bytes`           | Total bytes written to Badger.
 
 ### Memory Metrics
 
@@ -2022,6 +2345,27 @@ Jaeger collects distributed traces and provides a UI to view and query traces ac
 Dgraph can be configured to send traces directly to a Jaeger collector with the `--jaeger.collector` flag. For example, if the Jaeger collector is running on `http://localhost:14268`, then pass the flag to the Dgraph Zero and Dgraph Alpha instances as `--jaeger.collector=http://localhost:14268`.
 
 See [Jaeger's Getting Started docs](https://www.jaegertracing.io/docs/getting-started/) to get up and running with Jaeger.
+
+#### Setting up multiple Dgraph clusters with Jaeger
+
+Jaeger allows you to examine traces from multiple Dgraph clusters. To do this, use the `--collector.tags` on a Jaeger collector to set custom trace tags. For example, run one collector with `--collector.tags env=qa` and then another collector with `--collector.tags env=dev`. In Dgraph, set the `--jaeger.collector` flag in the Dgraph QA cluster to the first collector and the flag in the Dgraph Dev cluster to the second collector.
+You can run multiple Jaeger collector components for the same single Jaeger backend (e.g., many Jaeger collectors to a single Cassandra backend). This is still a single Jaeger installation but with different collectors customizing the tags per environment.
+
+Once you have this configured, you can filter by tags in the Jaeger UI. Filter traces by tags matching `env=dev`:
+
+{{% load-img "/images/jaeger-ui.png" "Jaeger UI" %}}
+
+Every trace has your custom tags set under the “Process” section of each span:
+
+{{% load-img "/images/jaeger-server-query.png" "Jaeger Query" %}}
+
+Filter traces by tags matching `env=qa`:
+
+{{% load-img "/images/jaeger-json.png" "Jaeger JSON" %}}
+
+{{% load-img "/images/jaeger-server-query-2.png" "Jaeger Query Result" %}}
+
+For more information, check out [Jaeger's Deployment Guide](https://www.jaegertracing.io/docs/deployment/).
 
 ## Dgraph Administration
 
@@ -2131,6 +2475,14 @@ $ curl 'localhost:8080/admin/export?format=json'
 ```
 
 Currently, "rdf" and "json" are the only formats supported.
+
+#### Encrypting Exports
+
+Export is available wherever an Alpha is running. To encrypt an export, the Alpha must be configured with the `encryption-key-file`.
+
+{{% notice "note" %}}
+The `encryption-key-file` was used for `encryption-at-rest` and will now also be used for encrypted backups and exports.
+{{% /notice %}}
 
 ### Shutdown Database
 

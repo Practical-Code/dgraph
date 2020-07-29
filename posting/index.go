@@ -24,6 +24,7 @@ import (
 	"io/ioutil"
 	"math"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"time"
 
@@ -91,9 +92,10 @@ func (txn *Txn) addIndexMutations(ctx context.Context, info *indexMutationInfo) 
 
 	attr := info.edge.Attr
 	uid := info.edge.Entity
-	x.AssertTrue(uid != 0)
+	if uid == 0 {
+		return errors.New("invalid UID with value 0")
+	}
 	tokens, err := indexTokens(info)
-
 	if err != nil {
 		// This data is not indexable
 		return err
@@ -511,7 +513,8 @@ func (r *rebuilder) Run(ctx context.Context) error {
 	// All the temp indexes go into the following directory. We delete the whole
 	// directory after the indexing step is complete. This deletes any other temp
 	// indexes that may have been left around in case defer wasn't executed.
-	tmpParentDir := "dgraph_index"
+	// TODO(Aman): If users are not happy, we could add a flag to choose this dir.
+	tmpParentDir := filepath.Join(os.TempDir(), "dgraph_index")
 
 	// We write the index in a temporary badger first and then,
 	// merge entries before writing them to p directory.
@@ -529,7 +532,6 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		WithSyncWrites(false).
 		WithNumVersionsToKeep(math.MaxInt64).
 		WithCompression(options.None).
-		WithEventLogging(false).
 		WithLogRotatesToFlush(10).
 		WithMaxCacheSize(50) // TODO(Aman): Disable cache altogether
 

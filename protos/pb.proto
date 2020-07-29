@@ -25,7 +25,7 @@ syntax = "proto3";
 package pb;
 
 import "api.proto";
-import "github.com/dgraph-io/badger/pb/pb.proto";
+import "github.com/dgraph-io/badger/v2/pb/pb.proto";
 
 /* import "gogoproto/gogo.proto"; */
 
@@ -262,21 +262,26 @@ message Snapshot {
 }
 
 message Proposal {
-	Mutations mutations    = 2;
-	repeated KV kv         = 4;
-	MembershipState state  = 5;
-	string clean_predicate = 6;  // Delete the predicate which was moved to other group.
-	string key             = 7;
-	OracleDelta delta      = 8;
-	Snapshot snapshot      = 9;  // Used to tell the group when to take snapshot.
-	uint64 index           = 10; // Used to store Raft index, in raft.Ready.
-	uint64 expected_checksum = 11; // Block an operation until membership reaches this checksum.
+	Mutations mutations    		= 2;
+	repeated badgerpb2.KV kv  = 4;
+	MembershipState state  		= 5;
+	string clean_predicate 		= 6;  // Delete the predicate which was moved to other group.
+	string key             		= 7;
+	OracleDelta delta      		= 8;
+	Snapshot snapshot      		= 9;  // Used to tell the group when to take snapshot.
+	uint64 index           		= 10; // Used to store Raft index, in raft.Ready.
+	uint64 expected_checksum 	= 11; // Block an operation until membership reaches this checksum.
 }
 
 message KVS {
- repeated pb.KV kv = 1;
- // done used to indicate if the stream of KVS is over.
- bool done      = 2;
+	repeated badgerpb2.KV kv = 1;
+
+	// done used to indicate if the stream of KVS is over.
+	bool done	= 2;
+	// predicates is the list of predicates known by the leader at the time of the snapshot.
+	repeated string predicates = 3;
+	// types is the list of types known by the leader at the time of the snapshot.
+	repeated string types = 4;
 }
 
 // Posting messages.
@@ -509,7 +514,7 @@ service Worker {
 	rpc Export (ExportRequest)              returns (Status) {}
 	rpc ReceivePredicate(stream KVS)        returns (api.Payload) {}
 	rpc MovePredicate(MovePredicatePayload) returns (api.Payload) {}
-	rpc Subscribe(SubscriptionRequest) returns (stream pb.KVList) {}
+	rpc Subscribe(SubscriptionRequest) returns (stream badgerpb2.KVList) {}
 }
 
 message SubscriptionRequest {
@@ -517,7 +522,7 @@ message SubscriptionRequest {
 }
 
 message SubscriptionResponse {
-    pb.KVList kvs = 1;
+    badgerpb2.KVList kvs = 1;
 }
 
 message Num {

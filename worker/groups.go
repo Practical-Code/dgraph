@@ -76,7 +76,7 @@ func groups() *groupi {
 func StartRaftNodes(walStore *badger.DB, bindall bool) {
 	gr.ctx, gr.cancel = context.WithCancel(context.Background())
 
-	if len(x.WorkerConfig.MyAddr) == 0 {
+	if x.WorkerConfig.MyAddr == "" {
 		x.WorkerConfig.MyAddr = fmt.Sprintf("localhost:%d", workerPort())
 	} else {
 		// check if address is valid or not
@@ -88,8 +88,11 @@ func StartRaftNodes(walStore *badger.DB, bindall bool) {
 	}
 
 	x.AssertTruef(len(x.WorkerConfig.ZeroAddr) > 0, "Providing dgraphzero address is mandatory.")
-	x.AssertTruef(x.WorkerConfig.ZeroAddr != x.WorkerConfig.MyAddr,
-		"Dgraph Zero address and Dgraph address (IP:Port) can't be the same.")
+	for _, zeroAddr := range x.WorkerConfig.ZeroAddr {
+		x.AssertTruef(zeroAddr != x.WorkerConfig.MyAddr,
+			"Dgraph Zero address %s and Dgraph address (IP:Port) %s can't be the same.",
+			zeroAddr, x.WorkerConfig.MyAddr)
+	}
 
 	if x.WorkerConfig.RaftId == 0 {
 		id, err := raftwal.RaftId(walStore)
@@ -114,6 +117,7 @@ func StartRaftNodes(walStore *badger.DB, bindall bool) {
 	}
 	var connState *pb.ConnectionState
 	var err error
+
 	for { // Keep on retrying. See: https://github.com/dgraph-io/dgraph/issues/2289
 		pl := gr.connToZeroLeader()
 		if pl == nil {
@@ -441,8 +445,6 @@ func (g *groupi) ServesTablet(key string) (bool, error) {
 
 // Do not modify the returned Tablet
 func (g *groupi) Tablet(key string) (*pb.Tablet, error) {
-	emptyTablet := pb.Tablet{}
-
 	// TODO: Remove all this later, create a membership state and apply it
 	g.RLock()
 	tablet, ok := g.tablets[key]
@@ -460,7 +462,7 @@ func (g *groupi) Tablet(key string) (*pb.Tablet, error) {
 	out, err := zc.ShouldServe(context.Background(), tablet)
 	if err != nil {
 		glog.Errorf("Error while ShouldServe grpc call %v", err)
-		return &emptyTablet, err
+		return nil, err
 	}
 
 	// Do not store tablets with group ID 0, as they are just dummy tablets for
@@ -630,14 +632,19 @@ func (g *groupi) connToZeroLeader() *conn.Pool {
 	// No leader found. Let's get the latest membership state from Zero.
 	delay := connBaseDelay
 	maxHalfDelay := time.Second
-	for { // Keep on retrying. See: https://github.com/dgraph-io/dgraph/issues/2289
+	for i := 0; ; i++ { // Keep on retrying. See: https://github.com/dgraph-io/dgraph/issues/2289
 		time.Sleep(delay)
 		if delay <= maxHalfDelay {
 			delay *= 2
 		}
+
+		zAddrList := x.WorkerConfig.ZeroAddr
+		// Pick addresses in round robin manner.
+		addr := zAddrList[i%len(zAddrList)]
+
 		pl := g.AnyServer(0)
 		if pl == nil {
-			pl = conn.GetPools().Connect(x.WorkerConfig.ZeroAddr)
+			pl = conn.GetPools().Connect(addr)
 		}
 		if pl == nil {
 			glog.V(1).Infof("No healthy Zero server found. Retrying...")
@@ -762,6 +769,7 @@ START:
 	ctx, cancel := context.WithCancel(context.Background())
 	stream, err := c.StreamMembership(ctx, &api.Payload{})
 	if err != nil {
+		cancel()
 		glog.Errorf("Error while calling update %v\n", err)
 		time.Sleep(time.Second)
 		goto START
@@ -920,8 +928,14 @@ func (g *groupi) processOracleDeltaStream() {
 						return
 					}
 					batch++
+					if delta.GroupChecksums == nil {
+						delta.GroupChecksums = make(map[uint32]uint64)
+					}
 					delta.Txns = append(delta.Txns, more.Txns...)
 					delta.MaxAssigned = x.Max(delta.MaxAssigned, more.MaxAssigned)
+					for gid, checksum := range more.GroupChecksums {
+						delta.GroupChecksums[gid] = checksum
+					}
 				default:
 					break SLURP
 				}

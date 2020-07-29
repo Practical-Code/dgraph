@@ -324,6 +324,7 @@ func (n *node) applyProposal(e raftpb.Entry) (string, error) {
 			return p.Key, errInvalidProposal
 		}
 		state.MaxRaftId = p.MaxRaftId
+		n.server.nextRaftId = x.Max(n.server.nextRaftId, p.MaxRaftId+1)
 	}
 	if p.SnapshotTs != nil {
 		for gid, ts := range p.SnapshotTs {
@@ -348,8 +349,8 @@ func (n *node) applyProposal(e raftpb.Entry) (string, error) {
 	}
 	if p.Tablet != nil {
 		if err := n.handleTabletProposal(p.Tablet); err != nil {
-			span.Annotatef(nil, "While applying tablet proposal: %+v", err)
-			glog.Errorf("While applying tablet proposal: %+v", err)
+			span.Annotatef(nil, "While applying tablet proposal: %v", err)
+			glog.Errorf("While applying tablet proposal: %v", err)
 			return p.Key, err
 		}
 	}

@@ -89,7 +89,7 @@ instances to achieve high-availability.
 	flag.Bool("telemetry", true, "Send anonymous telemetry data to Dgraph devs.")
 
 	// OpenCensus flags.
-	flag.Float64("trace", 1.0, "The ratio of queries to trace.")
+	flag.Float64("trace", 0.01, "The ratio of queries to trace.")
 	flag.String("jaeger.collector", "", "Send opencensus traces to Jaeger.")
 	// See https://github.com/DataDog/opencensus-go-exporter-datadog/issues/34
 	// about the status of supporting annotation logs through the datadog exporter
@@ -181,6 +181,12 @@ func run() {
 			return true, true
 		}
 	}
+
+	if opts.rebalanceInterval <= 0 {
+		log.Fatalf("ERROR: Rebalance interval must be greater than zero. Found: %d",
+			opts.rebalanceInterval)
+	}
+
 	grpc.EnableTracing = false
 	otrace.ApplyConfig(otrace.Config{
 		DefaultSampler: otrace.ProbabilitySampler(Zero.Conf.GetFloat64("trace"))})
@@ -204,14 +210,17 @@ func run() {
 	// Open raft write-ahead log and initialize raft node.
 	x.Checkf(os.MkdirAll(opts.w, 0700), "Error while creating WAL dir.")
 	kvOpt := badger.LSMOnlyOptions(opts.w).WithSyncWrites(false).WithTruncate(true).
-		WithValueLogFileSize(64 << 20).WithMaxCacheSize(10 << 20)
+		WithValueLogFileSize(64 << 20).WithMaxCacheSize(10 << 20).WithLoadBloomsOnOpen(false)
 
-	// TOOD(Ibrahim): Remove this once badger is updated.
-	kvOpt.ZSTDCompressionLevel = 1
+	kvOpt.ZSTDCompressionLevel = 3
 
 	kv, err := badger.Open(kvOpt)
 	x.Checkf(err, "Error while opening WAL store")
 	defer kv.Close()
+
+	gcCloser := y.NewCloser(1) // closer for vLogGC
+	go x.RunVlogGC(kv, gcCloser)
+	defer gcCloser.SignalAndWait()
 
 	// zero out from memory
 	kvOpt.EncryptionKey = nil
@@ -263,9 +272,12 @@ func run() {
 		_ = httpListener.Close()
 		// Stop Raft.
 		st.node.closer.SignalAndWait()
+		// Try to generate a snapshot before the shutdown.
+		st.node.trySnapshot(0)
+		// Stop Raft store.
+		store.Closer.SignalAndWait()
 		// Stop all internal requests.
 		_ = grpcListener.Close()
-		st.node.trySnapshot(0)
 	}()
 
 	glog.Infoln("Running Dgraph Zero...")

@@ -28,13 +28,14 @@ import (
 	bpb "github.com/dgraph-io/badger/v2/pb"
 	"github.com/pkg/errors"
 
+	"github.com/dgraph-io/dgraph/ee/enc"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
 )
 
 // RunRestore calls badger.Load and tries to load data into a new DB.
-func RunRestore(pdir, location, backupId string) LoadResult {
+func RunRestore(pdir, location, backupId, keyfile string) LoadResult {
 	// Create the pdir if it doesn't exist.
 	if err := os.MkdirAll(pdir, 0700); err != nil {
 		return LoadResult{0, 0, err}
@@ -43,14 +44,31 @@ func RunRestore(pdir, location, backupId string) LoadResult {
 	// Scan location for backup files and load them. Each file represents a node group,
 	// and we create a new p dir for each.
 	return Load(location, backupId,
-		func(r io.Reader, groupId int, preds predicateSet) (uint64, error) {
+		func(r io.Reader, groupId uint32, preds predicateSet) (uint64, error) {
 
 			dir := filepath.Join(pdir, fmt.Sprintf("p%d", groupId))
+			r, err := enc.GetReader(keyfile, r)
+			if err != nil {
+				return 0, err
+			}
+
+			gzReader, err := gzip.NewReader(r)
+			if err != nil {
+				if len(keyfile) != 0 {
+					err = errors.Wrap(err,
+						"Unable to read the backup. Ensure the encryption key is correct.")
+				}
+				return 0, err
+
+			}
+			// The badger DB should be opened only after creating the backup
+			// file reader and verifying the encryption in the backup file.
 			db, err := badger.OpenManaged(badger.DefaultOptions(dir).
 				WithSyncWrites(false).
 				WithTableLoadingMode(options.MemoryMap).
 				WithValueThreshold(1 << 10).
-				WithNumVersionsToKeep(math.MaxInt32))
+				WithNumVersionsToKeep(math.MaxInt32).
+				WithEncryptionKey(enc.ReadEncryptionKeyFile(keyfile)))
 			if err != nil {
 				return 0, err
 			}
@@ -59,15 +77,11 @@ func RunRestore(pdir, location, backupId string) LoadResult {
 			if !pathExist(dir) {
 				fmt.Println("Creating new db:", dir)
 			}
-			gzReader, err := gzip.NewReader(r)
-			if err != nil {
-				return 0, nil
-			}
+
 			maxUid, err := loadFromBackup(db, gzReader, preds)
 			if err != nil {
 				return 0, err
 			}
-
 			return maxUid, x.WriteGroupIdFile(dir, uint32(groupId))
 		})
 }
@@ -78,6 +92,14 @@ func RunRestore(pdir, location, backupId string) LoadResult {
 func loadFromBackup(db *badger.DB, r io.Reader, preds predicateSet) (uint64, error) {
 	br := bufio.NewReaderSize(r, 16<<10)
 	unmarshalBuf := make([]byte, 1<<10)
+
+	// Delete schemas and types. Each backup file should have a complete copy of the schema.
+	if err := db.DropPrefix([]byte{x.ByteSchema}); err != nil {
+		return 0, err
+	}
+	if err := db.DropPrefix([]byte{x.ByteType}); err != nil {
+		return 0, err
+	}
 
 	loader := db.NewKVLoader(16)
 	var maxUid uint64
