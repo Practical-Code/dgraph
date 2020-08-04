@@ -16,13 +16,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -30,12 +29,13 @@ import (
 
 	"github.com/dgraph-io/dgo/v200"
 	"github.com/dgraph-io/dgo/v200/protos/api"
-	minio "github.com/minio/minio-go"
+	minio "github.com/minio/minio-go/v6"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 
 	"github.com/dgraph-io/dgraph/testutil"
 	"github.com/dgraph-io/dgraph/worker"
+	"github.com/dgraph-io/dgraph/x"
 )
 
 var (
@@ -140,26 +140,11 @@ func addTriples(t *testing.T, dg *dgo.Dgraph, numTriples int) {
 }
 
 func runBackup(t *testing.T) {
-	backupRequest := `mutation backup($dst: String!) {
-		backup(input: {destination: $dst}) {
-			response {
-				code
-				message
-			}
-		}
-	}`
-
-	adminUrl := "http://localhost:8180/admin"
-	params := testutil.GraphQLParams{
-		Query: backupRequest,
-		Variables: map[string]interface{}{
-			"dst": backupDestination,
-		},
-	}
-	b, err := json.Marshal(params)
-	require.NoError(t, err)
-
-	resp, err := http.Post(adminUrl, "application/json", bytes.NewBuffer(b))
+	// Using the old /admin/backup endpoint to ensure it works. Change back to using
+	// the GraphQL endpoint at /admin once this endpoint is deprecated.
+	resp, err := http.PostForm("http://localhost:8180/admin/backup", url.Values{
+		"destination": []string{backupDestination},
+	})
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	buf, err := ioutil.ReadAll(resp.Body)
@@ -177,7 +162,7 @@ func runRestore(t *testing.T, backupLocation, lastDir string, commitTs uint64) m
 	require.NoError(t, os.MkdirAll(restoreDir, os.ModePerm))
 
 	t.Logf("--- Restoring from: %q", backupLocation)
-	result := worker.RunRestore("./data/restore", backupLocation, lastDir, "")
+	result := worker.RunRestore("./data/restore", backupLocation, lastDir, x.SensitiveByteSlice(nil))
 	require.NoError(t, result.Err)
 
 	restored1, err := testutil.GetPredicateValues("./data/restore/p1", "name1", commitTs)

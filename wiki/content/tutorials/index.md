@@ -1,10 +1,16 @@
 +++
 title = "Tutorials - Get Started with Dgraph series"
+[menu.main]
+  url = "/tutorials"
+  name = "Tutorials"
+  identifier = "tutorials"
+  weight = 3
 +++
 
-{{% notice "note" %}}This is a tutorial series on getting started with Dgraph. You can see find the quickstart guide [here]({{< relref "get-started/index.md" >}}).{{% /notice %}}
-
-## Tutorials
+{{% notice "note" %}}
+This is a tutorial series on getting started with Dgraph. You can find a
+single page quickstart guide [here]({{< relref "get-started/index.md" >}}).
+{{% /notice %}}
 
 **Welcome to Dgraph. Here are a series of tutorials for getting started :**
 
@@ -95,21 +101,32 @@ title = "Tutorials - Get Started with Dgraph series"
           </p>
         </div>
       </div>
+      <div class="col-12 col-sm-12">
+        <div class="section-item">
+          <div class="section-name">
+            <a href="{{< relref "tutorial-8/index.md">}}">
+              8 - Native Geolocation Features
+            </a>
+          </div>
+          <p class="section-desc">
+            Easily build location-aware apps using native geolocation features
+          </p>
+        </div>
+      </div>
     </div>
   </div>
 </section>
 
 ## Where to go from here
 
-- Go to [Clients]({{< relref "clients/index.md" >}}) to see how to communicate
+- Go to [Clients]({{< relref "clients/_index.md" >}}) to see how to communicate
 with Dgraph from your application.
-- Take the [Tour](https://tour.dgraph.io) for a guided tour of how to write queries in Dgraph.
-- A wider range of queries can also be found in the [Query Language]({{< relref "query-language/index.md" >}}) reference.
-- See [Deploy]({{< relref "deploy/index.md" >}}) if you wish to run Dgraph
+- Take the [Tour](https://dgraph.io/tour/) for a guided tour of how to write queries in Dgraph.
+- A wider range of queries can also be found in the [Query Language]({{< relref "query-language/_index.md" >}}) reference.
+- See [Deploy]({{< relref "deploy/_index.md" >}}) if you wish to run Dgraph
   in a cluster.
 
 ## Need Help
 
 * Please use [discuss.dgraph.io](https://discuss.dgraph.io) for questions, feature requests and discussions.
 * Please use [Github Issues](https://github.com/dgraph-io/dgraph/issues) if you encounter bugs or have feature requests.
-* You can also join our [Slack channel](http://slack.dgraph.io).

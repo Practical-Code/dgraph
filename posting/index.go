@@ -35,7 +35,6 @@ import (
 	"github.com/dgraph-io/badger/v2"
 	"github.com/dgraph-io/badger/v2/options"
 	bpb "github.com/dgraph-io/badger/v2/pb"
-	"github.com/dgraph-io/dgraph/ee/enc"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/schema"
 	"github.com/dgraph-io/dgraph/tok"
@@ -145,21 +144,21 @@ type countParams struct {
 func (txn *Txn) addReverseMutationHelper(ctx context.Context, plist *List,
 	hasCountIndex bool, edge *pb.DirectedEdge) (countParams, error) {
 	countBefore, countAfter := 0, 0
+	found := false
 
+	plist.Lock()
+	defer plist.Unlock()
 	if hasCountIndex {
-		countBefore = plist.Length(txn.StartTs, 0)
+		countBefore, found, _ = plist.getPostingAndLength(txn.StartTs, 0, edge.ValueId)
 		if countBefore == -1 {
 			return emptyCountParams, ErrTsTooOld
 		}
 	}
-	if err := plist.addMutation(ctx, txn, edge); err != nil {
+	if err := plist.addMutationInternal(ctx, txn, edge); err != nil {
 		return emptyCountParams, err
 	}
 	if hasCountIndex {
-		countAfter = plist.Length(txn.StartTs, 0)
-		if countAfter == -1 {
-			return emptyCountParams, ErrTsTooOld
-		}
+		countAfter = countAfterMutation(countBefore, found, edge.Op)
 		return countParams{
 			attr:        edge.Attr,
 			countBefore: countBefore,
@@ -212,8 +211,37 @@ func (txn *Txn) addReverseAndCountMutation(ctx context.Context, t *pb.DirectedEd
 	if err != nil {
 		return err
 	}
+	if plist == nil {
+		return errors.Errorf("nil posting list for reverse key %s", hex.Dump(key))
+	}
 
-	x.AssertTrue(plist != nil)
+	// For single uid predicates, updating the reverse index requires that the existing
+	// entries for this key in the index are removed.
+	pred, ok := schema.State().Get(ctx, t.Attr)
+	isSingleUidUpdate := ok && !pred.GetList() && pred.GetValueType() == pb.Posting_UID &&
+		t.Op == pb.DirectedEdge_SET && t.ValueId != 0
+	if isSingleUidUpdate {
+		dataKey := x.DataKey(t.Attr, t.Entity)
+		dataList, err := getFn(dataKey)
+		if err != nil {
+			return errors.Wrapf(err, "cannot find single uid list to update with key %s",
+				hex.Dump(dataKey))
+		}
+		err = dataList.Iterate(txn.StartTs, 0, func(p *pb.Posting) error {
+			delEdge := &pb.DirectedEdge{
+				Entity:  t.Entity,
+				ValueId: p.Uid,
+				Attr:    t.Attr,
+				Op:      pb.DirectedEdge_DEL,
+			}
+			return txn.addReverseAndCountMutation(ctx, delEdge)
+		})
+		if err != nil {
+			return errors.Wrapf(err, "cannot remove existing reverse index entries for key %s",
+				hex.Dump(dataKey))
+		}
+	}
+
 	// We must create a copy here.
 	edge := &pb.DirectedEdge{
 		Entity:  t.ValueId,
@@ -234,6 +262,7 @@ func (txn *Txn) addReverseAndCountMutation(ctx context.Context, t *pb.DirectedEd
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -330,11 +359,20 @@ func (txn *Txn) updateCount(ctx context.Context, params countParams) error {
 	return nil
 }
 
+func countAfterMutation(countBefore int, found bool, op pb.DirectedEdge_Op) int {
+	if !found && op == pb.DirectedEdge_SET {
+		return countBefore + 1
+	} else if found && op == pb.DirectedEdge_DEL {
+		return countBefore - 1
+	}
+
+	// Only conditions remaining are below, for which countAfter will be same as countBefore.
+	// (found && op == pb.DirectedEdge_SET) || (!found && op == pb.DirectedEdge_DEL)
+	return countBefore
+}
+
 func (txn *Txn) addMutationHelper(ctx context.Context, l *List, doUpdateIndex bool,
 	hasCountIndex bool, t *pb.DirectedEdge) (types.Val, bool, countParams, error) {
-	var val types.Val
-	var found bool
-	var err error
 
 	t1 := time.Now()
 	l.Lock()
@@ -346,9 +384,33 @@ func (txn *Txn) addMutationHelper(ctx context.Context, l *List, doUpdateIndex bo
 			"Acquired lock %v %v %v", dur, t.Attr, t.Entity)
 	}
 
-	if doUpdateIndex {
-		// Check original value BEFORE any mutation actually happens.
-		val, found, err = l.findValue(txn.StartTs, fingerprintEdge(t))
+	getUID := func(t *pb.DirectedEdge) uint64 {
+		if t.ValueType == pb.Posting_UID {
+			return t.ValueId
+		}
+		return fingerprintEdge(t)
+	}
+
+	// For countIndex we need to check if some posting already exists for uid and length of posting
+	// list, hence will are calling l.getPostingAndLength(). If doUpdateIndex or delNonListPredicate
+	// is true, we just need to get the posting for uid, hence calling l.findPosting().
+	countBefore, countAfter := 0, 0
+	var currPost *pb.Posting
+	var val types.Val
+	var found bool
+	var err error
+
+	delNonListPredicate := !schema.State().IsList(t.Attr) &&
+		t.Op == pb.DirectedEdge_DEL && string(t.Value) != x.Star
+
+	switch {
+	case hasCountIndex:
+		countBefore, found, currPost = l.getPostingAndLength(txn.StartTs, 0, getUID(t))
+		if countBefore == -1 {
+			return val, false, emptyCountParams, ErrTsTooOld
+		}
+	case doUpdateIndex || delNonListPredicate:
+		found, currPost, err = l.findPosting(txn.StartTs, fingerprintEdge(t))
 		if err != nil {
 			return val, found, emptyCountParams, err
 		}
@@ -356,12 +418,8 @@ func (txn *Txn) addMutationHelper(ctx context.Context, l *List, doUpdateIndex bo
 
 	// If the predicate schema is not a list, ignore delete triples whose object is not a star or
 	// a value that does not match the existing value.
-	if !schema.State().IsList(t.Attr) && t.Op == pb.DirectedEdge_DEL && string(t.Value) != x.Star {
+	if delNonListPredicate {
 		newPost := NewPosting(t)
-		pFound, currPost, err := l.findPosting(txn.StartTs, fingerprintEdge(t))
-		if err != nil {
-			return val, found, emptyCountParams, err
-		}
 
 		// This is a scalar value of non-list type and a delete edge mutation, so if the value
 		// given by the user doesn't match the value we have, we return found to be false, to avoid
@@ -369,27 +427,22 @@ func (txn *Txn) addMutationHelper(ctx context.Context, l *List, doUpdateIndex bo
 		// This second check is required because we fingerprint the scalar values as math.MaxUint64,
 		// so even though they might be different the check in the doUpdateIndex block above would
 		// return found to be true.
-		if pFound && !(bytes.Equal(currPost.Value, newPost.Value) &&
+		if found && !(bytes.Equal(currPost.Value, newPost.Value) &&
 			types.TypeID(currPost.ValType) == types.TypeID(newPost.ValType)) {
 			return val, false, emptyCountParams, nil
 		}
 	}
 
-	countBefore, countAfter := 0, 0
-	if hasCountIndex {
-		countBefore = l.length(txn.StartTs, 0)
-		if countBefore == -1 {
-			return val, found, emptyCountParams, ErrTsTooOld
-		}
-	}
 	if err = l.addMutationInternal(ctx, txn, t); err != nil {
 		return val, found, emptyCountParams, err
 	}
+
+	if found && doUpdateIndex {
+		val = valueToTypesVal(currPost)
+	}
+
 	if hasCountIndex {
-		countAfter = l.length(txn.StartTs, 0)
-		if countAfter == -1 {
-			return val, found, emptyCountParams, ErrTsTooOld
-		}
+		countAfter = countAfterMutation(countBefore, found, t.Op)
 		return val, found, countParams{
 			attr:        t.Attr,
 			countBefore: countBefore,
@@ -403,7 +456,7 @@ func (txn *Txn) addMutationHelper(ctx context.Context, l *List, doUpdateIndex bo
 // AddMutationWithIndex is addMutation with support for indexing. It also
 // supports reverse edges.
 func (l *List) AddMutationWithIndex(ctx context.Context, edge *pb.DirectedEdge, txn *Txn) error {
-	if len(edge.Attr) == 0 {
+	if edge.Attr == "" {
 		return errors.Errorf("Predicate cannot be empty for edge with subject: [%v], object: [%v]"+
 			" and value: [%v]", edge.Entity, edge.ValueId, edge.Value)
 	}
@@ -414,6 +467,15 @@ func (l *List) AddMutationWithIndex(ctx context.Context, edge *pb.DirectedEdge, 
 
 	doUpdateIndex := pstore != nil && schema.State().IsIndexed(ctx, edge.Attr)
 	hasCountIndex := schema.State().HasCount(ctx, edge.Attr)
+
+	// Add reverse mutation irrespective of hasMutated, server crash can happen after
+	// mutation is synced and before reverse edge is synced
+	if (pstore != nil) && (edge.ValueId != 0) && schema.State().IsReversed(ctx, edge.Attr) {
+		if err := txn.addReverseAndCountMutation(ctx, edge); err != nil {
+			return err
+		}
+	}
+
 	val, found, cp, err := txn.addMutationHelper(ctx, l, doUpdateIndex, hasCountIndex, edge)
 	if err != nil {
 		return err
@@ -449,13 +511,6 @@ func (l *List) AddMutationWithIndex(ctx context.Context, edge *pb.DirectedEdge, 
 			}); err != nil {
 				return err
 			}
-		}
-	}
-	// Add reverse mutation irrespective of hasMutated, server crash can happen after
-	// mutation is synced and before reverse edge is synced
-	if (pstore != nil) && (edge.ValueId != 0) && schema.State().IsReversed(ctx, edge.Attr) {
-		if err := txn.addReverseAndCountMutation(ctx, edge); err != nil {
-			return err
 		}
 	}
 	return nil
@@ -558,7 +613,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		WithLogger(&x.ToGlog{}).
 		WithCompression(options.None).
 		WithLogRotatesToFlush(10).
-		WithEncryptionKey(enc.ReadEncryptionKeyFile(x.WorkerConfig.BadgerKeyFile))
+		WithEncryptionKey(x.WorkerConfig.EncryptionKey)
 	tmpDB, err := badger.OpenManaged(dbOpts)
 	if err != nil {
 		return errors.Wrap(err, "error opening temp badger for reindexing")
@@ -573,10 +628,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 	// We set it to 1 in case there are no keys found and NewStreamAt is called with ts=0.
 	var counter uint64 = 1
 
-	// TODO(Aman): Replace TxnWriter with WriteBatch. While we do that we should ensure that
-	// WriteBatch has a mechanism for throttling. Also, find other places where TxnWriter
-	// could be replaced with WriteBatch in the code
-	tmpWriter := NewTxnWriter(tmpDB)
+	tmpWriter := tmpDB.NewManagedWriteBatch()
 	stream := pstore.NewStreamAt(r.startTs)
 	stream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (1/2):", r.attr)
 	stream.Prefix = r.prefix
@@ -650,7 +702,7 @@ func (r *rebuilder) Run(ctx context.Context) error {
 			r.attr, time.Since(start))
 	}()
 
-	writer := NewTxnWriter(pstore)
+	writer := pstore.NewManagedWriteBatch()
 	tmpStream := tmpDB.NewStreamAt(counter)
 	tmpStream.LogPrefix = fmt.Sprintf("Rebuilding index for predicate %s (2/2):", r.attr)
 	tmpStream.KeyToList = func(key []byte, itr *badger.Iterator) (*bpb.KVList, error) {
@@ -669,6 +721,8 @@ func (r *rebuilder) Run(ctx context.Context) error {
 		return &bpb.KVList{Kv: kvs}, nil
 	}
 	tmpStream.Send = func(kvList *bpb.KVList) error {
+		// TODO (Anurag): Instead of calling SetEntryAt everytime, we can filter KVList and call Write only once.
+		// SetEntryAt requries lock for every entry, whereas Write reduces lock contention.
 		for _, kv := range kvList.Kv {
 			if len(kv.Value) == 0 {
 				continue
@@ -676,7 +730,8 @@ func (r *rebuilder) Run(ctx context.Context) error {
 
 			// We choose to write the PL at r.startTs, so it won't be read by txns,
 			// which occurred before this schema mutation.
-			if err := writer.SetAt(kv.Key, kv.Value, BitCompletePosting, r.startTs); err != nil {
+			e := &badger.Entry{Key: kv.Key, Value: kv.Value, UserMeta: BitCompletePosting}
+			if err := writer.SetEntryAt(e.WithDiscard(), r.startTs); err != nil {
 				return errors.Wrap(err, "error in writing index to pstore")
 			}
 		}

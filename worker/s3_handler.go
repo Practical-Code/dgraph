@@ -17,32 +17,17 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/dgraph-io/dgraph/protos/pb"
-	"github.com/dgraph-io/dgraph/x"
 
 	"github.com/golang/glog"
-	minio "github.com/minio/minio-go"
-	"github.com/minio/minio-go/pkg/credentials"
-	"github.com/minio/minio-go/pkg/s3utils"
+	minio "github.com/minio/minio-go/v6"
+	"github.com/minio/minio-go/v6/pkg/credentials"
 	"github.com/pkg/errors"
-)
-
-const (
-	// Shown in transfer logs
-	appName = "Dgraph"
-
-	// defaultEndpointS3 is used with s3 scheme when no host is provided
-	defaultEndpointS3 = "s3.amazonaws.com"
-
-	// s3AccelerateSubstr S3 acceleration is enabled if the S3 host is contains this substring.
-	// See http://docs.aws.amazon.com/AmazonS3/latest/dev/transfer-acceleration.html
-	s3AccelerateSubstr = "s3-accelerate"
 )
 
 // FillRestoreCredentials fills the empty values with the default credentials so that
@@ -53,30 +38,18 @@ func FillRestoreCredentials(location string, req *pb.RestoreRequest) error {
 		return err
 	}
 
-	var provider credentials.Provider
-	switch uri.Scheme {
-	case "s3":
-		provider = &credentials.EnvAWS{}
-	case "minio":
-		provider = &credentials.EnvMinio{}
-	default:
-		return nil
+	defaultCreds := credentials.Value{
+		AccessKeyID:     req.AccessKey,
+		SecretAccessKey: req.SecretKey,
+		SessionToken:    req.SessionToken,
 	}
+	provider := credentialsProvider(uri.Scheme, defaultCreds)
 
-	if req == nil {
-		return nil
-	}
+	creds, _ := provider.Retrieve() // Error is always nil.
 
-	defaultCreds, _ := provider.Retrieve() // Error is always nil.
-	if len(req.AccessKey) == 0 {
-		req.AccessKey = defaultCreds.AccessKeyID
-	}
-	if len(req.SecretKey) == 0 {
-		req.SecretKey = defaultCreds.SecretAccessKey
-	}
-	if len(req.SessionToken) == 0 {
-		req.SessionToken = defaultCreds.SessionToken
-	}
+	req.AccessKey = creds.AccessKeyID
+	req.SecretKey = creds.SecretAccessKey
+	req.SessionToken = creds.SessionToken
 
 	return nil
 }
@@ -95,91 +68,12 @@ type s3Handler struct {
 // setup also fills in values used by the handler in subsequent calls.
 // Returns a new S3 minio client, otherwise a nil client with an error.
 func (h *s3Handler) setup(uri *url.URL) (*minio.Client, error) {
-	if len(uri.Path) < 1 {
-		return nil, errors.Errorf("Invalid bucket: %q", uri.Path)
-	}
-
-	glog.V(2).Infof("Backup using host: %s, path: %s", uri.Host, uri.Path)
-
-	var creds credentials.Value
-	switch {
-	case h.creds.isAnonymous():
-		// No need to setup credentials.
-	case !h.creds.hasCredentials():
-		var provider credentials.Provider
-		switch uri.Scheme {
-		case "s3":
-			// Access Key ID:     AWS_ACCESS_KEY_ID or AWS_ACCESS_KEY.
-			// Secret Access Key: AWS_SECRET_ACCESS_KEY or AWS_SECRET_KEY.
-			// Secret Token:      AWS_SESSION_TOKEN.
-			provider = &credentials.EnvAWS{}
-		default: // minio
-			// Access Key ID:     MINIO_ACCESS_KEY.
-			// Secret Access Key: MINIO_SECRET_KEY.
-			provider = &credentials.EnvMinio{}
-		}
-
-		// If no credentials can be retrieved, an attempt to access the destination
-		// with no credentials will be made.
-		creds, _ = provider.Retrieve() // error is always nil
-	default:
-		creds.AccessKeyID = h.creds.AccessKey
-		creds.SecretAccessKey = h.creds.SecretKey
-		creds.SessionToken = h.creds.SessionToken
-	}
-
-	// Verify URI and set default S3 host if needed.
-	switch uri.Scheme {
-	case "s3":
-		// s3:///bucket/folder
-		if !strings.Contains(uri.Host, ".") {
-			uri.Host = defaultEndpointS3
-		}
-		if !s3utils.IsAmazonEndpoint(*uri) {
-			return nil, errors.Errorf("Invalid S3 endpoint %q", uri.Host)
-		}
-	default: // minio
-		if uri.Host == "" {
-			return nil, errors.Errorf("Minio handler requires a host")
-		}
-	}
-
-	secure := uri.Query().Get("secure") != "false" // secure by default
-
-	mc, err := minio.New(uri.Host, creds.AccessKeyID, creds.SecretAccessKey, secure)
+	mc, err := newMinioClient(uri, h.creds)
 	if err != nil {
 		return nil, err
 	}
 
-	// Set client app name "Dgraph/v1.0.x"
-	mc.SetAppInfo(appName, x.Version())
-
-	// S3 transfer acceleration support.
-	if uri.Scheme == "s3" && strings.Contains(uri.Host, s3AccelerateSubstr) {
-		mc.SetS3TransferAccelerate(uri.Host)
-	}
-
-	// enable HTTP tracing
-	if uri.Query().Get("trace") == "true" {
-		mc.TraceOn(os.Stderr)
-	}
-
-	// split path into bucketName and blobPrefix
-	parts := strings.Split(uri.Path[1:], "/")
-	h.bucketName = parts[0] // bucket
-
-	// verify the requested bucket exists.
-	found, err := mc.BucketExists(h.bucketName)
-	if err != nil {
-		return nil, errors.Wrapf(err, "while looking for bucket %s at host %s",
-			h.bucketName, uri.Host)
-	}
-	if !found {
-		return nil, errors.Errorf("Bucket was not found: %s", h.bucketName)
-	}
-	if len(parts) > 1 {
-		h.objectPrefix = filepath.Join(parts[1:]...)
-	}
+	h.bucketName, h.objectPrefix, err = validateBucket(mc, uri)
 
 	return mc, err
 }
@@ -365,7 +259,7 @@ func (h *s3Handler) Load(uri *url.URL, backupId string, fn loadFn) LoadResult {
 			// of the last backup.
 			predSet := manifests[len(manifests)-1].getPredsInGroup(gid)
 
-			groupMaxUid, err := fn(reader, int(gid), predSet)
+			groupMaxUid, err := fn(reader, gid, predSet)
 			if err != nil {
 				return LoadResult{0, 0, err}
 			}

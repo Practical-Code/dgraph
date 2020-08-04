@@ -521,6 +521,9 @@ func (l *List) getMutation(startTs uint64) []byte {
 	l.RLock()
 	defer l.RUnlock()
 	if pl, ok := l.mutationMap[startTs]; ok {
+		for _, p := range pl.GetPostings() {
+			p.StartTs = 0
+		}
 		data, err := pl.Marshal()
 		x.Check(err)
 		return data
@@ -588,6 +591,7 @@ func (l *List) pickPostings(readTs uint64) (uint64, []*pb.Posting) {
 					deleteBelowTs = effectiveTs
 					continue
 				}
+				mpost.StartTs = startTs
 				posts = append(posts, mpost)
 			}
 		}
@@ -730,6 +734,26 @@ func (l *List) IsEmpty(readTs, afterUid uint64) (bool, error) {
 	return count == 0, nil
 }
 
+func (l *List) getPostingAndLength(readTs, afterUid, uid uint64) (int, bool, *pb.Posting) {
+	l.AssertRLock()
+	var count int
+	var found bool
+	var post *pb.Posting
+	err := l.iterate(readTs, afterUid, func(p *pb.Posting) error {
+		if p.Uid == uid {
+			post = p
+			found = true
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return -1, false, nil
+	}
+
+	return count, found, post
+}
+
 func (l *List) length(readTs, afterUid uint64) int {
 	l.AssertRLock()
 	count := 0
@@ -810,26 +834,29 @@ func (l *List) Rollup() ([]*bpb.KV, error) {
 
 // SingleListRollup works like rollup but generates a single list with no splits.
 // It's used during backup so that each backed up posting list is stored in a single key.
-func (l *List) SingleListRollup() (*bpb.KV, error) {
+func (l *List) SingleListRollup(kv *bpb.KV) error {
+	if kv == nil {
+		return errors.Errorf("passed kv pointer cannot be nil")
+	}
+
 	l.RLock()
 	defer l.RUnlock()
 
 	out, err := l.rollup(math.MaxUint64, false)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed when calling List.rollup")
+		return errors.Wrapf(err, "failed when calling List.rollup")
 	}
 	// out is only nil when the list's minTs is greater than readTs but readTs
 	// is math.MaxUint64 so that's not possible. Assert that's true.
 	x.AssertTrue(out != nil)
 
-	kv := &bpb.KV{}
 	kv.Version = out.newMinTs
 	kv.Key = l.key
 	val, meta := marshalPostingList(out.plist)
 	kv.UserMeta = []byte{meta}
 	kv.Value = val
 
-	return kv, nil
+	return nil
 }
 
 func (out *rollupOutput) marshalPostingListPart(
@@ -1318,6 +1345,13 @@ func shouldSplit(plist *pb.PostingList) bool {
 	return plist.Size() >= maxListSize && len(plist.Pack.Blocks) > 1
 }
 
+func (out *rollupOutput) updateSplits() {
+	if out.plist == nil {
+		out.plist = &pb.PostingList{}
+	}
+	out.plist.Splits = out.splits()
+}
+
 func (out *rollupOutput) recursiveSplit() {
 	// Call splitUpList. Otherwise the map of startUids to parts won't be initialized.
 	out.splitUpList()
@@ -1344,7 +1378,7 @@ func (out *rollupOutput) splitUpList() {
 	var lists []*pb.PostingList
 
 	// If list is not split yet, insert the main list.
-	if len(out.plist.Splits) == 0 {
+	if len(out.parts) == 0 {
 		lists = append(lists, out.plist)
 	}
 
@@ -1354,13 +1388,10 @@ func (out *rollupOutput) splitUpList() {
 		lists = append(lists, part)
 	}
 
-	// List of startUids for each list part after the splitting process is complete.
-	var newSplits []uint64
-
 	for i, list := range lists {
 		startUid := uint64(1)
 		// If the list is split, select the right startUid for this list.
-		if len(out.plist.Splits) > 0 {
+		if len(out.parts) > 0 {
 			startUid = out.plist.Splits[i]
 		}
 
@@ -1370,23 +1401,11 @@ func (out *rollupOutput) splitUpList() {
 			startUids, pls := binSplit(startUid, list)
 			for i, startUid := range startUids {
 				out.parts[startUid] = pls[i]
-				newSplits = append(newSplits, startUid)
 			}
-		} else {
-			// No need to split the list. Add the startUid to the array of new splits.
-			newSplits = append(newSplits, startUid)
 		}
 	}
 
-	// No new lists were created so there's no need to update the list of splits.
-	if len(newSplits) == len(lists) {
-		return
-	}
-
-	// The splits changed so update them.
-	out.plist = &pb.PostingList{
-		Splits: newSplits,
-	}
+	out.updateSplits()
 }
 
 // binSplit takes the given plist and returns two new plists, each with
@@ -1424,28 +1443,26 @@ func binSplit(lowUid uint64, plist *pb.PostingList) ([]uint64, []*pb.PostingList
 
 // removeEmptySplits updates the split list by removing empty posting lists' startUids.
 func (out *rollupOutput) removeEmptySplits() {
-	var splits []uint64
 	for startUid, plist := range out.parts {
 		// Do not remove the first split for now, as every multi-part list should always
 		// have a split starting with UID 1.
 		if startUid == 1 {
-			splits = append(splits, startUid)
 			continue
 		}
 
-		if !isPlistEmpty(plist) {
-			splits = append(splits, startUid)
+		if isPlistEmpty(plist) {
+			delete(out.parts, startUid)
 		}
 	}
-	out.plist.Splits = splits
-	sortSplits(splits)
+	out.updateSplits()
 
-	if len(out.plist.Splits) == 1 {
+	if len(out.parts) == 1 && isPlistEmpty(out.parts[1]) {
 		// Only the first split remains. If it's also empty, remove it as well.
 		// This should mark the entire list for deletion. Please note that the
 		// startUid of the first part is always one because a node can never have
 		// its uid set to zero.
 		if isPlistEmpty(out.parts[1]) {
+			delete(out.parts, 1)
 			out.plist.Splits = []uint64{}
 		}
 	}
@@ -1490,17 +1507,15 @@ func (l *List) PartSplits() []uint64 {
 }
 
 // ToBackupPostingList converts a posting list into its representation used for storing backups.
-func ToBackupPostingList(l *pb.PostingList) *pb.BackupPostingList {
-	bl := pb.BackupPostingList{}
-	if l == nil {
-		return &bl
+func ToBackupPostingList(l *pb.PostingList, bl *pb.BackupPostingList) {
+	if l == nil || bl == nil {
+		return
 	}
 
 	bl.Uids = codec.Decode(l.Pack, 0)
 	bl.Postings = l.Postings
 	bl.CommitTs = l.CommitTs
 	bl.Splits = l.Splits
-	return &bl
 }
 
 // FromBackupPostingList converts a posting list in the format used for backups to a

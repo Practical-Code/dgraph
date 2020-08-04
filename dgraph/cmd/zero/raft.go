@@ -303,7 +303,7 @@ func (n *node) applyProposal(e raftpb.Entry) (string, error) {
 	if err := p.Unmarshal(e.Data); err != nil {
 		return p.Key, err
 	}
-	if len(p.Key) == 0 {
+	if p.Key == "" {
 		return p.Key, errInvalidProposal
 	}
 	span := otrace.FromContext(n.Proposals.Ctx(p.Key))
@@ -324,6 +324,7 @@ func (n *node) applyProposal(e raftpb.Entry) (string, error) {
 			return p.Key, errInvalidProposal
 		}
 		state.MaxRaftId = p.MaxRaftId
+		n.server.nextRaftId = x.Max(n.server.nextRaftId, p.MaxRaftId+1)
 	}
 	if p.SnapshotTs != nil {
 		for gid, ts := range p.SnapshotTs {
@@ -438,6 +439,73 @@ func (n *node) triggerLeaderChange() {
 	n.server.updateZeroLeader()
 }
 
+func (n *node) proposeNewCID() {
+	// Either this is a new cluster or can't find a CID in the entries. So, propose a new ID for the cluster.
+	// CID check is needed for the case when a leader assigns a CID to the new node and the new node is proposing a CID
+	for len(n.server.membershipState().Cid) == 0 {
+		id := uuid.New().String()
+		err := n.proposeAndWait(context.Background(), &pb.ZeroProposal{Cid: id})
+		if err == nil {
+			glog.Infof("CID set for cluster: %v", id)
+			break
+		}
+		if err == errInvalidProposal {
+			glog.Errorf("invalid proposal error while proposing cluster id")
+			return
+		}
+		glog.Errorf("While proposing CID: %v. Retrying...", err)
+		time.Sleep(3 * time.Second)
+	}
+
+	// Apply trial license only if not already licensed.
+	if n.server.license() == nil {
+		if err := n.proposeTrialLicense(); err != nil {
+			glog.Errorf("while proposing trial license to cluster: %v", err)
+		}
+	}
+}
+
+func (n *node) checkForCIDInEntries() (bool, error) {
+	first, err := n.Store.FirstIndex()
+	if err != nil {
+		return false, err
+	}
+	last, err := n.Store.LastIndex()
+	if err != nil {
+		return false, err
+	}
+
+	for batch := first; batch <= last; {
+		entries, err := n.Store.Entries(batch, last+1, 64<<20)
+		if err != nil {
+			return false, err
+		}
+
+		// Exit early from the loop if no entries were found.
+		if len(entries) == 0 {
+			break
+		}
+
+		// increment the iterator to the next batch
+		batch = entries[len(entries)-1].Index + 1
+
+		for _, entry := range entries {
+			if entry.Type != raftpb.EntryNormal {
+				continue
+			}
+			var proposal pb.ZeroProposal
+			err = proposal.Unmarshal(entry.Data)
+			if err != nil {
+				return false, err
+			}
+			if len(proposal.Cid) > 0 {
+				return true, err
+			}
+		}
+	}
+	return false, err
+}
+
 func (n *node) initAndStartNode() error {
 	_, restart, err := n.PastLife()
 	x.Check(err)
@@ -460,6 +528,13 @@ func (n *node) initAndStartNode() error {
 		}
 
 		n.SetRaft(raft.RestartNode(n.Cfg))
+		foundCID, err := n.checkForCIDInEntries()
+		if err != nil {
+			return err
+		}
+		if !foundCID {
+			go n.proposeNewCID()
+		}
 
 	case len(opts.peer) > 0:
 		p := conn.GetPools().Connect(opts.peer)
@@ -499,28 +574,7 @@ func (n *node) initAndStartNode() error {
 		x.Check(err)
 		peers := []raft.Peer{{ID: n.Id, Context: data}}
 		n.SetRaft(raft.StartNode(n.Cfg, peers))
-
-		go func() {
-			// This is a new cluster. So, propose a new ID for the cluster.
-			for {
-				id := uuid.New().String()
-				err := n.proposeAndWait(context.Background(), &pb.ZeroProposal{Cid: id})
-				if err == nil {
-					glog.Infof("CID set for cluster: %v", id)
-					break
-				}
-				if err == errInvalidProposal {
-					glog.Errorf("invalid proposal error while proposing cluster id")
-					return
-				}
-				glog.Errorf("While proposing CID: %v. Retrying...", err)
-				time.Sleep(3 * time.Second)
-			}
-
-			if err := n.proposeTrialLicense(); err != nil {
-				glog.Errorf("while proposing trial license to cluster: %v", err)
-			}
-		}()
+		go n.proposeNewCID()
 	}
 
 	go n.Run()
@@ -618,6 +672,7 @@ func (n *node) trySnapshot(skip uint64) {
 
 func (n *node) Run() {
 	var leader bool
+	licenseApplied := false
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -734,6 +789,17 @@ func (n *node) Run() {
 					"Raft.Ready took too long to process: %s."+
 						" Num entries: %d. MustSync: %v",
 					timer.String(), len(rd.Entries), rd.MustSync)
+			}
+
+			// Apply license when I am the leader.
+			if !licenseApplied && n.AmLeader() {
+				licenseApplied = true
+				// Apply the EE License given on CLI which may over-ride previous
+				// license, if present. That is an intended behavior to allow customers
+				// to apply new/renewed licenses.
+				if license := Zero.Conf.GetString("enterprise_license"); len(license) > 0 {
+					go n.server.applyLicenseFile(license)
+				}
 			}
 		}
 	}

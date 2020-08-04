@@ -60,6 +60,13 @@ enum DgraphIndex {
 	hour
 }
 
+input AuthRule {
+	and: [AuthRule]
+	or: [AuthRule]
+	not: AuthRule
+	rule: String
+}
+
 enum HTTPMethod {
 	GET
 	POST
@@ -68,25 +75,37 @@ enum HTTPMethod {
 	DELETE
 }
 
+enum Mode {
+	BATCH
+	SINGLE
+}
+
 input CustomHTTP {
 	url: String!
 	method: HTTPMethod!
-	body: String!
+	body: String
+	graphql: String
+	mode: Mode
 	forwardHeaders: [String!]
-}
-
-input CustomGraphQL {
-	query: String!
+	secretHeaders: [String!]
+	introspectionHeaders: [String!]
+	skipIntrospection: Boolean
 }
 
 directive @hasInverse(field: String!) on FIELD_DEFINITION
 directive @search(by: [DgraphIndex!]) on FIELD_DEFINITION
 directive @dgraph(type: String, pred: String) on OBJECT | INTERFACE | FIELD_DEFINITION
 directive @id on FIELD_DEFINITION
+directive @withSubscription on OBJECT | INTERFACE
 directive @secret(field: String!, pred: String) on OBJECT | INTERFACE
-directive @custom(http: CustomHTTP, graphql: CustomGraphQL) on FIELD_DEFINITION
+directive @auth(
+	query: AuthRule,
+	add: AuthRule,
+	update: AuthRule,
+	delete:AuthRule) on OBJECT
+directive @custom(http: CustomHTTP, dql: String) on FIELD_DEFINITION
 directive @remote on OBJECT | INTERFACE
-
+directive @cascade on FIELD
 
 input IntFilter {
 	eq: Int
@@ -158,21 +177,25 @@ type AddStarshipPayload {
 }
 
 type DeleteCharacterPayload {
+	character(filter: CharacterFilter, order: CharacterOrder, first: Int, offset: Int): [Character]
 	msg: String
 	numUids: Int
 }
 
 type DeleteDroidPayload {
+	droid(filter: DroidFilter, order: DroidOrder, first: Int, offset: Int): [Droid]
 	msg: String
 	numUids: Int
 }
 
 type DeleteHumanPayload {
+	human(filter: HumanFilter, order: HumanOrder, first: Int, offset: Int): [Human]
 	msg: String
 	numUids: Int
 }
 
 type DeleteStarshipPayload {
+	starship(filter: StarshipFilter, order: StarshipOrder, first: Int, offset: Int): [Starship]
 	msg: String
 	numUids: Int
 }
@@ -417,17 +440,3 @@ type Mutation {
 	deleteStarship(filter: StarshipFilter!): DeleteStarshipPayload
 }
 
-#######################
-# Generated Subscriptions
-#######################
-
-type Subscription {
-	getCharacter(id: ID!): Character
-	queryCharacter(filter: CharacterFilter, order: CharacterOrder, first: Int, offset: Int): [Character]
-	getHuman(id: ID!): Human
-	queryHuman(filter: HumanFilter, order: HumanOrder, first: Int, offset: Int): [Human]
-	getDroid(id: ID!): Droid
-	queryDroid(filter: DroidFilter, order: DroidOrder, first: Int, offset: Int): [Droid]
-	getStarship(id: ID!): Starship
-	queryStarship(filter: StarshipFilter, order: StarshipOrder, first: Int, offset: Int): [Starship]
-}

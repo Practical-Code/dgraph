@@ -60,7 +60,7 @@ func graphQLCompletionOn(t *testing.T) {
 	// The schema states type Country `{ ... name: String! ... }`
 	// so a query error will be raised if we ask for the country's name in a
 	// query.  Don't think a GraphQL update can do this ATM, so do through Dgraph.
-	d, err := grpc.Dial(alphagRPC, grpc.WithInsecure())
+	d, err := grpc.Dial(AlphagRPC, grpc.WithInsecure())
 	require.NoError(t, err)
 	client := dgo.NewDgraphClient(api.NewDgraphClient(d))
 	mu := &api.Mutation{
@@ -253,7 +253,7 @@ func panicCatcher(t *testing.T) {
 			require.Equal(t, x.GqlErrorList{
 				{Message: fmt.Sprintf("Internal Server Error - a panic was trapped.  " +
 					"This indicates a bug in the GraphQL server.  A stack trace was logged.  " +
-					"Please let us know : https://github.com/dgraph-io/dgraph/issues.")}},
+					"Please let us know by filing an issue with the stack trace.")}},
 				gqlResponse.Errors)
 
 			require.Nil(t, gqlResponse.Data, string(gqlResponse.Data))
@@ -266,6 +266,10 @@ type panicClient struct{}
 func (dg *panicClient) Execute(ctx context.Context, req *dgoapi.Request) (*dgoapi.Response, error) {
 	x.Panic(errors.New(panicMsg))
 	return nil, nil
+}
+
+func (dg *panicClient) CommitOrAbort(ctx context.Context, tc *dgoapi.TxnContext) error {
+	return nil
 }
 
 // clientInfoLogin check whether the client info(IP address) is propagated in the request.

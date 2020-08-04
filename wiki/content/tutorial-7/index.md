@@ -170,7 +170,7 @@ built-in function `match` to run a fuzzy search query.
 
 Here is the syntax of the `match` function: `match(predicate, search string, distance)`
 
-The [match function](https://docs.dgraph.io/query-language/#fuzzy-matching) takes in three parameters:
+The [match function](https://dgraph.io/docs/query-language/#fuzzy-matching) takes in three parameters:
 
 1. The name of the string predicate used for querying.
 2. The search string provided by the user
@@ -289,25 +289,15 @@ Fuzzy search is a simple and yet effective search technique for a wide range of 
 Along with the existing features to query and search string predicates, the addition of
 `tf-idf` based search will further improve Dgraph's capabilities.
 
-This marks the end of our three tutorial-streak exploring string indices and their queries
+This marks the end of our three tutorial streak exploring string indices and their queries
 using the graph model of tweets.
 
-See you all in the next tutorial with some more exciting topics. Till then, happy Graphing!
+Check out our next tutorial of the getting started series [here]({{< relref "tutorial-8/index.md" >}}).
 
 Remember to click the “Join our community” button below and subscribe to our newsletter
 to get the latest tutorial right to your inbox.
-
-## What's Next?
-
-- Go to [Clients]({{< relref "clients/index.md" >}}) to see how to communicate
-with Dgraph from your application.
-- Take the [Tour](https://tour.dgraph.io) for a guided tour of how to write queries in Dgraph.
-- A wider range of queries can also be found in the [Query Language]({{< relref "query-language/index.md" >}}) reference.
-- See [Deploy]({{< relref "deploy/index.md" >}}) if you wish to run Dgraph
-  in a cluster.
 
 ## Need Help
 
 * Please use [discuss.dgraph.io](https://discuss.dgraph.io) for questions, feature requests and discussions.
 * Please use [Github Issues](https://github.com/dgraph-io/dgraph/issues) if you encounter bugs or have feature requests.
-* You can also join our [Slack channel](http://slack.dgraph.io).

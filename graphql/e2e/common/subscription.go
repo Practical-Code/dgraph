@@ -18,6 +18,7 @@ package common
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -40,6 +41,8 @@ const (
 	dataMsg = "data"
 	// Message type for terminating the subscription.
 	terminateMsg = "connection_terminate"
+	// Message type to indicate that given message is of error type
+	errorMsg = "error"
 )
 
 type operationMessage struct {
@@ -55,7 +58,7 @@ type GraphQLSubscriptionClient struct {
 }
 
 // NewGraphQLSubscription returns graphql subscription client.
-func NewGraphQLSubscription(url string, req *schema.Request) (*GraphQLSubscriptionClient, error) {
+func NewGraphQLSubscription(url string, req *schema.Request, subscriptionPayload string) (*GraphQLSubscriptionClient, error) {
 	header := http.Header{
 		"Sec-WebSocket-Protocol": []string{protocolGraphQLWS},
 	}
@@ -63,11 +66,10 @@ func NewGraphQLSubscription(url string, req *schema.Request) (*GraphQLSubscripti
 	if err != nil {
 		return nil, err
 	}
-
 	// Initialize subscription.
 	init := operationMessage{
 		Type:    initMsg,
-		Payload: []byte(`{}`),
+		Payload: []byte(subscriptionPayload),
 	}
 
 	// Send Intialization message to the graphql server.
@@ -121,6 +123,9 @@ func (client *GraphQLSubscriptionClient) RecvMsg() ([]byte, error) {
 	// TODO: handle complete, error... for testing. This should be enough.
 	// We can do this, if we are planning to opensource this as subscription
 	// library.
+	if msg.Type == errorMsg {
+		return nil, errors.New(string(msg.Payload))
+	}
 	if msg.Type != dataMsg {
 		return nil, nil
 	}

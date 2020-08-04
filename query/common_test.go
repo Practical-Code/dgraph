@@ -29,11 +29,17 @@ import (
 )
 
 func setSchema(schema string) {
-	err := client.Alter(context.Background(), &api.Operation{
-		Schema: schema,
-	})
-	if err != nil {
-		panic(fmt.Sprintf("Could not alter schema. Got error %v", err.Error()))
+	for retry := 0; retry < 3; retry++ {
+		err := client.Alter(context.Background(), &api.Operation{
+			Schema: schema,
+		})
+		if err == nil {
+			return
+		}
+		// We'll panic if we are in last iteration.
+		if retry == 2 {
+			panic(fmt.Sprintf("Could not alter schema. Got error %v", err.Error()))
+		}
 	}
 }
 
@@ -686,7 +692,7 @@ func populateCluster() {
 		<510> <newfriend> <511> .
 		<510> <newfriend> <512> .
 
-		<51> <connects> <52>  (weight=10) .
+		<51> <connects> <52>  (weight=11) .
 		<51> <connects> <53>  (weight=1) .
 		<51> <connects> <54>  (weight=10) .
 
@@ -699,7 +705,7 @@ func populateCluster() {
 		<52> <connects> <54>  (weight=10) .
 
 		<54> <connects> <51>  (weight=10) .
-		<54> <connects> <52>  (weight=1) .
+		<54> <connects> <52>  (weight=2) .
 		<54> <connects> <53>  (weight=10) .
 		<54> <connects> <55>  (weight=1) .
 

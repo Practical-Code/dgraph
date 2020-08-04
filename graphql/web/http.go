@@ -20,26 +20,34 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"strconv"
+	"time"
+
+	"github.com/dgrijalva/jwt-go/v4"
+	"google.golang.org/grpc/metadata"
 
 	"io"
 	"io/ioutil"
 	"mime"
-	"net"
 	"net/http"
-	"strconv"
 	"strings"
 
-	"github.com/golang/glog"
-	"github.com/graph-gophers/graphql-transport-ws/graphqlws"
-	"go.opencensus.io/trace"
-	"google.golang.org/grpc/peer"
-
 	"github.com/dgraph-io/dgraph/graphql/api"
+	"github.com/dgraph-io/dgraph/graphql/authorization"
 	"github.com/dgraph-io/dgraph/graphql/resolve"
 	"github.com/dgraph-io/dgraph/graphql/schema"
 	"github.com/dgraph-io/dgraph/graphql/subscription"
 	"github.com/dgraph-io/dgraph/x"
+	"github.com/dgraph-io/graphql-transport-ws/graphqlws"
+	"github.com/golang/glog"
 	"github.com/pkg/errors"
+	"go.opencensus.io/trace"
+)
+
+type Headerkey string
+
+const (
+	touchedUidsHeader = "Graphql-TouchedUids"
 )
 
 // An IServeGraphQL can serve a GraphQL endpoint (currently only ons http)
@@ -89,6 +97,9 @@ func (gh *graphqlHandler) Resolve(ctx context.Context, gqlReq *schema.Request) *
 func write(w http.ResponseWriter, rr *schema.Response, acceptGzip bool) {
 	var out io.Writer = w
 
+	// set TouchedUids header
+	w.Header().Set(touchedUidsHeader, strconv.FormatUint(rr.GetExtensions().GetTouchedUids(), 10))
+
 	// If the receiver accepts gzip, then we would update the writer
 	// and send gzipped content instead.
 	if acceptGzip {
@@ -113,12 +124,45 @@ func (gs *graphqlSubscription) Subscribe(
 	operationName string,
 	variableValues map[string]interface{}) (payloads <-chan interface{},
 	err error) {
+
+	// library (graphql-transport-ws) passes the headers which are part of the INIT payload to us in the context.
+	// And we are extracting the Auth JWT from those and passing them along.
+
+	header, _ := ctx.Value("Header").(json.RawMessage)
+	customClaims := &authorization.CustomClaims{
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: jwt.At(time.Time{}),
+		},
+	}
+	if len(header) > 0 {
+		payload := make(map[string]interface{})
+		if err := json.Unmarshal(header, &payload); err != nil {
+			return nil, err
+		}
+
+		name := authorization.GetHeader()
+		val, ok := payload[name].(string)
+		if ok {
+
+			md := metadata.New(map[string]string{
+				"authorizationJwt": val,
+			})
+			ctx = metadata.NewIncomingContext(ctx, md)
+
+			customClaims, err = authorization.ExtractCustomClaims(ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	req := &schema.Request{
 		OperationName: operationName,
 		Query:         document,
 		Variables:     variableValues,
 	}
-	res, err := gs.graphqlHandler.poller.AddSubscriber(req)
+
+	res, err := gs.graphqlHandler.poller.AddSubscriber(req, customClaims)
 	if err != nil {
 		return nil, err
 	}
@@ -153,20 +197,11 @@ func (gh *graphqlHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		x.Panic(errors.New("graphqlHandler not initialised"))
 	}
 
+	ctx = authorization.AttachAuthorizationJwt(ctx, r)
 	ctx = x.AttachAccessJwt(ctx, r)
-
-	if ip, port, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		// Add remote addr as peer info so that the remote address can be logged
-		// inside Server.Login
-		if intPort, convErr := strconv.Atoi(port); convErr == nil {
-			ctx = peer.NewContext(ctx, &peer.Peer{
-				Addr: &net.TCPAddr{
-					IP:   net.ParseIP(ip),
-					Port: intPort,
-				},
-			})
-		}
-	}
+	// Add remote addr as peer info so that the remote address can be logged
+	// inside Server.Login
+	ctx = x.AttachRemoteIP(ctx, r)
 
 	var res *schema.Response
 	gqlReq, err := getRequest(ctx, r)

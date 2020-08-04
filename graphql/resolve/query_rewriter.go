@@ -23,6 +23,7 @@ import (
 	"strconv"
 
 	"github.com/dgraph-io/dgraph/gql"
+	"github.com/dgraph-io/dgraph/graphql/authorization"
 	"github.com/dgraph-io/dgraph/graphql/schema"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/pkg/errors"
@@ -30,14 +31,68 @@ import (
 
 type queryRewriter struct{}
 
+type authRewriter struct {
+	authVariables map[string]interface{}
+	isWritingAuth bool
+	// `filterByUid` is used to when we have to rewrite top level query with uid function. The
+	// variable name is passed in `varName`. If true it will rewrite as following:
+	// queryType(uid(varName)) {
+	// Once such case is when we perform query in delete mutation.
+	filterByUid bool
+	selector    func(t schema.Type) *schema.RuleNode
+	varGen      *VariableGenerator
+	varName     string
+	// `parentVarName` is used to link a query with it's previous level.
+	parentVarName string
+	// `hasAuthRules` indicates if any of fields in the complete query hierarchy has auth rules.
+	hasAuthRules bool
+}
+
 // NewQueryRewriter returns a new QueryRewriter.
 func NewQueryRewriter() QueryRewriter {
 	return &queryRewriter{}
 }
 
+func hasAuthRules(field schema.Field, authRw *authRewriter) bool {
+	rn := authRw.selector(field.Type())
+	if rn != nil {
+		return true
+	}
+
+	for _, childField := range field.SelectionSet() {
+		if authRules := hasAuthRules(childField, authRw); authRules {
+			return true
+		}
+	}
+	return false
+}
+
 // Rewrite rewrites a GraphQL query into a Dgraph GraphQuery.
-func (qr *queryRewriter) Rewrite(ctx context.Context,
+func (qr *queryRewriter) Rewrite(
+	ctx context.Context,
 	gqlQuery schema.Query) (*gql.GraphQuery, error) {
+
+	if gqlQuery.Type().InterfaceImplHasAuthRules() {
+		return &gql.GraphQuery{Attr: gqlQuery.ResponseName() + "()"}, nil
+	}
+
+	authVariables, _ := ctx.Value(authorization.AuthVariables).(map[string]interface{})
+
+	if authVariables == nil {
+		customClaims, err := authorization.ExtractCustomClaims(ctx)
+		if err != nil {
+			return nil, err
+		}
+		authVariables = customClaims.AuthVariables
+	}
+
+	authRw := &authRewriter{
+		authVariables: authVariables,
+		varGen:        NewVariableGenerator(),
+		selector:      queryAuthSelector,
+		parentVarName: gqlQuery.Type().Name() + "Root",
+	}
+	authRw.hasAuthRules = hasAuthRules(gqlQuery, authRw)
 
 	switch gqlQuery.QueryType() {
 	case schema.GetQuery:
@@ -56,25 +111,25 @@ func (qr *queryRewriter) Rewrite(ctx context.Context,
 			return nil, err
 		}
 
-		dgQuery := rewriteAsGet(gqlQuery, uid, xid)
+		dgQuery := rewriteAsGet(gqlQuery, uid, xid, authRw)
 		return dgQuery, nil
 
 	case schema.FilterQuery:
-		return rewriteAsQuery(gqlQuery), nil
+		return rewriteAsQuery(gqlQuery, authRw), nil
 	case schema.PasswordQuery:
-		return passwordQuery(gqlQuery)
+		return passwordQuery(gqlQuery, authRw)
 	default:
 		return nil, errors.Errorf("unimplemented query type %s", gqlQuery.QueryType())
 	}
 }
 
-func passwordQuery(m schema.Query) (*gql.GraphQuery, error) {
+func passwordQuery(m schema.Query, authRw *authRewriter) (*gql.GraphQuery, error) {
 	xid, uid, err := m.IDArgValue()
 	if err != nil {
 		return nil, err
 	}
 
-	dgQuery := rewriteAsGet(m, uid, xid)
+	dgQuery := rewriteAsGet(m, uid, xid, authRw)
 
 	queriedType := m.Type()
 	name := queriedType.PasswordField().Name()
@@ -170,20 +225,37 @@ func addUID(dgQuery *gql.GraphQuery) {
 	dgQuery.Children = append(dgQuery.Children, uidChild)
 }
 
-func rewriteAsQueryByIds(field schema.Field, uids []uint64) *gql.GraphQuery {
+func rewriteAsQueryByIds(field schema.Field, uids []uint64, authRw *authRewriter) *gql.GraphQuery {
+	rbac := authRw.evaluateStaticRules(field.Type())
 	dgQuery := &gql.GraphQuery{
-		Attr: field.ResponseName(),
-		Func: &gql.Function{
-			Name: "uid",
-			UID:  uids,
-		},
+		Attr: field.Name(),
 	}
 
-	if ids := idFilter(field, field.Type().IDField()); ids != nil {
+	if rbac == schema.Negative {
+		dgQuery.Attr = dgQuery.Attr + "()"
+		return dgQuery
+	}
+
+	dgQuery.Func = &gql.Function{
+		Name: "uid",
+		UID:  uids,
+	}
+
+	if ids := idFilter(extractQueryFilter(field), field.Type().IDField()); ids != nil {
 		addUIDFunc(dgQuery, intersection(ids, uids))
 	}
 
 	addArgumentsToField(dgQuery, field)
+	selectionAuth := addSelectionSetFrom(dgQuery, field, authRw)
+	addUID(dgQuery)
+	addCascadeDirective(dgQuery, field)
+
+	dgQuery = authRw.addAuthQueries(field.Type(), dgQuery, rbac)
+
+	if len(selectionAuth) > 0 {
+		dgQuery = &gql.GraphQuery{Children: append([]*gql.GraphQuery{dgQuery}, selectionAuth...)}
+	}
+
 	return dgQuery
 }
 
@@ -194,16 +266,51 @@ func addArgumentsToField(dgQuery *gql.GraphQuery, field schema.Field) {
 	addFilter(dgQuery, field.Type(), filter)
 	addOrder(dgQuery, field)
 	addPagination(dgQuery, field)
-	addSelectionSetFrom(dgQuery, field)
-	addUID(dgQuery)
 }
 
-func rewriteAsGet(field schema.Field, uid uint64, xid *string) *gql.GraphQuery {
+func addTopLevelTypeFilter(query *gql.GraphQuery, field schema.Field) {
+	if query.Attr != "" {
+		addTypeFilter(query, field.Type())
+		return
+	}
+
+	var rootQuery *gql.GraphQuery
+	for _, q := range query.Children {
+		if q.Attr == field.Name() {
+			rootQuery = q
+			break
+		}
+		for _, cq := range q.Children {
+			if cq.Attr == field.Name() {
+				rootQuery = cq
+				break
+			}
+		}
+	}
+
+	if rootQuery != nil {
+		addTypeFilter(rootQuery, field.Type())
+	}
+}
+
+func rewriteAsGet(
+	field schema.Field,
+	uid uint64,
+	xid *string,
+	auth *authRewriter) *gql.GraphQuery {
+
 	var dgQuery *gql.GraphQuery
+	rbac := auth.evaluateStaticRules(field.Type())
+	if rbac == schema.Negative {
+		return &gql.GraphQuery{Attr: field.ResponseName() + "()"}
+	}
 
 	if xid == nil {
-		dgQuery = rewriteAsQueryByIds(field, []uint64{uid})
-		addTypeFilter(dgQuery, field.Type())
+		dgQuery = rewriteAsQueryByIds(field, []uint64{uid}, auth)
+
+		// Add the type filter to the top level get query. When the auth has been written into the
+		// query the top level get query may be present in query's children.
+		addTopLevelTypeFilter(dgQuery, field)
 		return dgQuery
 	}
 
@@ -218,7 +325,7 @@ func rewriteAsGet(field schema.Field, uid uint64, xid *string) *gql.GraphQuery {
 
 	if uid > 0 {
 		dgQuery = &gql.GraphQuery{
-			Attr: field.ResponseName(),
+			Attr: field.Name(),
 			Func: &gql.Function{
 				Name: "uid",
 				UID:  []uint64{uid},
@@ -230,29 +337,274 @@ func rewriteAsGet(field schema.Field, uid uint64, xid *string) *gql.GraphQuery {
 
 	} else {
 		dgQuery = &gql.GraphQuery{
-			Attr: field.ResponseName(),
+			Attr: field.Name(),
 			Func: eqXidFunc,
 		}
 	}
-	addSelectionSetFrom(dgQuery, field)
+	selectionAuth := addSelectionSetFrom(dgQuery, field, auth)
 	addUID(dgQuery)
 	addTypeFilter(dgQuery, field.Type())
+	addCascadeDirective(dgQuery, field)
+
+	dgQuery = auth.addAuthQueries(field.Type(), dgQuery, rbac)
+
+	if len(selectionAuth) > 0 {
+		dgQuery = &gql.GraphQuery{Children: append([]*gql.GraphQuery{dgQuery}, selectionAuth...)}
+	}
+
 	return dgQuery
 }
 
-func rewriteAsQuery(field schema.Field) *gql.GraphQuery {
+func rewriteAsQuery(field schema.Field, authRw *authRewriter) *gql.GraphQuery {
+	rbac := authRw.evaluateStaticRules(field.Type())
 	dgQuery := &gql.GraphQuery{
-		Attr: field.ResponseName(),
+		Attr: field.Name(),
 	}
 
-	if ids := idFilter(field, field.Type().IDField()); ids != nil {
+	if rbac == schema.Negative {
+		dgQuery.Attr = dgQuery.Attr + "()"
+		return dgQuery
+	}
+
+	if authRw != nil && (authRw.isWritingAuth || authRw.filterByUid) && (authRw.varName != "" || authRw.parentVarName != "") {
+		// When rewriting auth rules, they always start like
+		//   Todo2 as var(func: uid(Todo1)) @cascade {
+		// Where Todo1 is the variable generated from the filter of the field
+		// we are adding auth to.
+
+		authRw.addVariableUIDFunc(dgQuery)
+		// This is executed when querying while performing delete mutation request since
+		// in case of delete mutation we already have variable `MutationQueryVar` at root level.
+		if authRw.filterByUid {
+			// Since the variable is only added at the top level we reset the `authRW` variables.
+			authRw.varName = ""
+			authRw.filterByUid = false
+		}
+	} else if ids := idFilter(extractQueryFilter(field), field.Type().IDField()); ids != nil {
 		addUIDFunc(dgQuery, ids)
 	} else {
 		addTypeFunc(dgQuery, field.Type().DgraphName())
 	}
 
 	addArgumentsToField(dgQuery, field)
+	selectionAuth := addSelectionSetFrom(dgQuery, field, authRw)
+	addUID(dgQuery)
+	addCascadeDirective(dgQuery, field)
+
+	dgQuery = authRw.addAuthQueries(field.Type(), dgQuery, rbac)
+
+	if len(selectionAuth) > 0 {
+		dgQuery = &gql.GraphQuery{Children: append([]*gql.GraphQuery{dgQuery}, selectionAuth...)}
+	}
+
 	return dgQuery
+}
+
+func (authRw *authRewriter) writingAuth() bool {
+	return authRw != nil && authRw.isWritingAuth
+
+}
+
+// addAuthQueries takes a field and the GraphQuery that has so far been constructed for
+// the field and builds any auth queries that are need to restrict the result to only
+// the nodes authorized to be queried, returning a new graphQuery that does the
+// original query and the auth.
+func (authRw *authRewriter) addAuthQueries(
+	typ schema.Type,
+	dgQuery *gql.GraphQuery,
+	rbacEval schema.RuleResult) *gql.GraphQuery {
+
+	// There's no need to recursively inject auth queries into other auth queries, so if
+	// we are already generating an auth query, there's nothing to add.
+	if authRw == nil || authRw.isWritingAuth {
+		return dgQuery
+	}
+
+	authRw.varName = authRw.varGen.Next(typ, "", "", authRw.isWritingAuth)
+
+	fldAuthQueries, filter := authRw.rewriteAuthQueries(typ)
+	if len(fldAuthQueries) == 0 && !authRw.hasAuthRules {
+		return dgQuery
+	}
+
+	if rbacEval != schema.Uncertain {
+		fldAuthQueries = nil
+		filter = nil
+	}
+
+	// build a query like
+	//   Todo1 as var(func: ... ) @filter(...)
+	// that has the filter from the user query in it.  This is then used as
+	// the starting point for both the user query and the auth query.
+	//
+	// We already have the query, so just copy it and modify the original
+	varQry := &gql.GraphQuery{
+		Var:    authRw.varName,
+		Attr:   "var",
+		Func:   dgQuery.Func,
+		Filter: dgQuery.Filter,
+	}
+
+	rootQry := &gql.GraphQuery{
+		Var:  authRw.parentVarName,
+		Attr: "var",
+		Func: &gql.Function{
+			Name: "uid",
+			Args: []gql.Arg{{Value: authRw.varName}},
+		},
+		Filter: filter,
+		Order:  dgQuery.Order,
+		Args:   dgQuery.Args,
+	}
+
+	dgQuery.Filter = nil
+	dgQuery.Args = nil
+
+	// The user query starts from the var query generated above and is filtered
+	// by the the filter generated from auth processing, so now we build
+	//   queryTodo(func: uid(Todo1)) @filter(...auth-queries...) { ... }
+	dgQuery.Func = &gql.Function{
+		Name: "uid",
+		Args: []gql.Arg{{Value: authRw.parentVarName}},
+	}
+
+	// The final query that includes the user's filter and auth processsing is thus like
+	//
+	// queryTodo(func: uid(Todo1)) @filter(uid(Todo2) AND uid(Todo3)) { ... }
+	// Todo1 as var(func: ... ) @filter(...)
+	// Todo2 as var(func: uid(Todo1)) @cascade { ...auth query 1... }
+	// Todo3 as var(func: uid(Todo1)) @cascade { ...auth query 2... }
+	return &gql.GraphQuery{Children: append([]*gql.GraphQuery{dgQuery, rootQry, varQry}, fldAuthQueries...)}
+}
+
+func (authRw *authRewriter) addVariableUIDFunc(q *gql.GraphQuery) {
+	varName := authRw.parentVarName
+	if authRw.varName != "" {
+		varName = authRw.varName
+	}
+
+	q.Func = &gql.Function{
+		Name: "uid",
+		Args: []gql.Arg{{Value: varName}},
+	}
+}
+
+func queryAuthSelector(t schema.Type) *schema.RuleNode {
+	auth := t.AuthRules()
+	if auth == nil || auth.Rules == nil {
+		return nil
+	}
+
+	return auth.Rules.Query
+}
+
+func (authRw *authRewriter) rewriteAuthQueries(typ schema.Type) ([]*gql.GraphQuery, *gql.FilterTree) {
+	if authRw == nil || authRw.isWritingAuth {
+		return nil, nil
+	}
+
+	return (&authRewriter{
+		authVariables: authRw.authVariables,
+		varGen:        authRw.varGen,
+		isWritingAuth: true,
+		varName:       authRw.varName,
+		selector:      authRw.selector,
+		parentVarName: authRw.parentVarName,
+		hasAuthRules:  authRw.hasAuthRules,
+	}).rewriteRuleNode(typ, authRw.selector(typ))
+}
+
+func (authRw *authRewriter) evaluateStaticRules(typ schema.Type) schema.RuleResult {
+	if authRw == nil || authRw.isWritingAuth {
+		return schema.Uncertain
+	}
+
+	rn := authRw.selector(typ)
+	return rn.EvaluateStatic(authRw.authVariables)
+}
+
+func (authRw *authRewriter) rewriteRuleNode(
+	typ schema.Type,
+	rn *schema.RuleNode) ([]*gql.GraphQuery, *gql.FilterTree) {
+
+	if typ == nil || rn == nil {
+		return nil, nil
+	}
+
+	nodeList := func(
+		typ schema.Type,
+		rns []*schema.RuleNode) ([]*gql.GraphQuery, []*gql.FilterTree) {
+
+		var qrys []*gql.GraphQuery
+		var filts []*gql.FilterTree
+		for _, orRn := range rns {
+			q, f := authRw.rewriteRuleNode(typ, orRn)
+			qrys = append(qrys, q...)
+			if f != nil {
+				filts = append(filts, f)
+			}
+		}
+		return qrys, filts
+	}
+
+	switch {
+	case len(rn.And) > 0:
+		qrys, filts := nodeList(typ, rn.And)
+		if len(filts) == 0 {
+			return qrys, nil
+		}
+		if len(filts) == 1 {
+			return qrys, filts[0]
+		}
+		return qrys, &gql.FilterTree{
+			Op:    "and",
+			Child: filts,
+		}
+	case len(rn.Or) > 0:
+		qrys, filts := nodeList(typ, rn.Or)
+		if len(filts) == 0 {
+			return qrys, nil
+		}
+		if len(filts) == 1 {
+			return qrys, filts[0]
+		}
+		return qrys, &gql.FilterTree{
+			Op:    "or",
+			Child: filts,
+		}
+	case rn.Not != nil:
+		qrys, filter := authRw.rewriteRuleNode(typ, rn.Not)
+		if filter == nil {
+			return qrys, nil
+		}
+		return qrys, &gql.FilterTree{
+			Op:    "not",
+			Child: []*gql.FilterTree{filter},
+		}
+	case rn.Rule != nil:
+		if rn.EvaluateStatic(authRw.authVariables) == schema.Negative {
+			return nil, nil
+		}
+
+		// create a copy of the auth query that's specialized for the values from the JWT
+		qry := rn.Rule.AuthFor(typ, authRw.authVariables)
+
+		// build
+		// Todo2 as var(func: uid(Todo1)) @cascade { ...auth query 1... }
+		varName := authRw.varGen.Next(typ, "", "", authRw.isWritingAuth)
+		r1 := rewriteAsQuery(qry, authRw)
+		r1.Var = varName
+		r1.Attr = "var"
+		r1.Cascade = append(r1.Cascade, "__all__")
+
+		return []*gql.GraphQuery{r1}, &gql.FilterTree{
+			Func: &gql.Function{
+				Name: "uid",
+				Args: []gql.Arg{{Value: varName}},
+			},
+		}
+	}
+	return nil, nil
 }
 
 func addTypeFilter(q *gql.GraphQuery, typ schema.Type) {
@@ -262,13 +614,16 @@ func addTypeFilter(q *gql.GraphQuery, typ schema.Type) {
 			Args: []gql.Arg{{Value: typ.DgraphName()}},
 		},
 	}
+	addToFilterTree(q, thisFilter)
+}
 
+func addToFilterTree(q *gql.GraphQuery, filter *gql.FilterTree) {
 	if q.Filter == nil {
-		q.Filter = thisFilter
+		q.Filter = filter
 	} else {
 		q.Filter = &gql.FilterTree{
 			Op:    "and",
-			Child: []*gql.FilterTree{q.Filter, thisFilter},
+			Child: []*gql.FilterTree{q.Filter, filter},
 		}
 	}
 }
@@ -285,17 +640,37 @@ func addTypeFunc(q *gql.GraphQuery, typ string) {
 		Name: "type",
 		Args: []gql.Arg{{Value: typ}},
 	}
-
 }
 
-func addSelectionSetFrom(q *gql.GraphQuery, field schema.Field) {
+// addSelectionSetFrom adds all the selections from field into q, and returns a list
+// of extra queries needed to satisfy auth requirements
+func addSelectionSetFrom(
+	q *gql.GraphQuery,
+	field schema.Field,
+	auth *authRewriter) []*gql.GraphQuery {
+
+	var authQueries []*gql.GraphQuery
+
 	// Only add dgraph.type as a child if this field is an interface type and has some children.
 	// dgraph.type would later be used in completeObject as different objects in the resulting
 	// JSON would return different fields based on their concrete type.
-	if field.InterfaceType() && len(field.SelectionSet()) > 0 {
-		q.Children = append(q.Children, &gql.GraphQuery{
-			Attr: "dgraph.type",
-		})
+	selSet := field.SelectionSet()
+	if len(selSet) > 0 {
+		if field.InterfaceType() {
+			q.Children = append(q.Children, &gql.GraphQuery{
+				Attr: "dgraph.type",
+			})
+
+		} else if !auth.writingAuth() &&
+			len(selSet) == 1 &&
+			selSet[0].Name() == schema.Typename {
+			q.Children = append(q.Children, &gql.GraphQuery{
+				//we don't need this for auth queries because they are added by us used for internal purposes.
+				// Querying it for them would just add an overhead which we can avoid.
+				Attr:  "uid",
+				Alias: "dgraph.uid",
+			})
+		}
 	}
 
 	// These fields might not have been requested by the user directly as part of the query but
@@ -322,11 +697,7 @@ func addSelectionSetFrom(q *gql.GraphQuery, field schema.Field) {
 
 		child := &gql.GraphQuery{}
 
-		if f.Alias() != "" {
-			child.Alias = f.Alias()
-		} else {
-			child.Alias = f.Name()
-		}
+		child.Alias = f.Name()
 
 		if f.Type().Name() == schema.IDType {
 			child.Attr = "uid"
@@ -338,11 +709,101 @@ func addSelectionSetFrom(q *gql.GraphQuery, field schema.Field) {
 		addFilter(child, f.Type(), filter)
 		addOrder(child, f)
 		addPagination(child, f)
+		addCascadeDirective(child, f)
+		rbac := auth.evaluateStaticRules(f.Type())
 
-		addSelectionSetFrom(child, f)
+		// Since the recursion processes the query in bottom up way, we store the state of the so
+		// that we can restore it later.
+		var parentVarName, parentQryName string
+		if len(f.SelectionSet()) > 0 && !auth.isWritingAuth && auth.hasAuthRules {
+			parentVarName = auth.parentVarName
+			parentQryName = auth.varGen.Next(f.Type(), "", "", auth.isWritingAuth)
+			auth.parentVarName = parentQryName
+			auth.varName = parentQryName
+		}
 
+		selectionAuth := addSelectionSetFrom(child, f, auth)
 		addedFields[f.Name()] = true
-		q.Children = append(q.Children, child)
+
+		if len(f.SelectionSet()) > 0 && !auth.isWritingAuth && auth.hasAuthRules {
+			// Restore the state after processing is done.
+			auth.parentVarName = parentVarName
+			auth.varName = parentQryName
+		}
+
+		if rbac == schema.Positive || rbac == schema.Uncertain {
+			q.Children = append(q.Children, child)
+		}
+
+		// If RBAC rules are evaluated to Negative, we don't write queries for deeper levels.
+		// Hence we don't need to do any further processing for this field.
+		if rbac == schema.Negative {
+			continue
+		}
+
+		var fieldAuth []*gql.GraphQuery
+		var authFilter *gql.FilterTree
+		// If RBAC rules are evaluated to `Uncertain` then we add the Auth rules.
+		if rbac == schema.Uncertain {
+			fieldAuth, authFilter = auth.rewriteAuthQueries(f.Type())
+		}
+
+		if authFilter != nil {
+			if child.Filter == nil {
+				child.Filter = authFilter
+			} else {
+				child.Filter = &gql.FilterTree{
+					Op:    "and",
+					Child: []*gql.FilterTree{child.Filter, authFilter},
+				}
+			}
+		}
+
+		if len(f.SelectionSet()) > 0 && !auth.isWritingAuth && auth.hasAuthRules {
+			// This adds the following query.
+			//	var(func: uid(Ticket)) {
+			//		User as Ticket.assignedTo
+			//	}
+			// where `Ticket` is the nodes selected at parent level and `User` is the nodes we
+			// need on the current level.
+			parentQry := &gql.GraphQuery{
+				Func: &gql.Function{
+					Name: "uid",
+					Args: []gql.Arg{{Value: auth.parentVarName}},
+				},
+				Attr:     "var",
+				Children: []*gql.GraphQuery{{Attr: f.DgraphPredicate(), Var: parentQryName}},
+			}
+
+			// This query aggregates all filters and auth rules and is used by root query to filter
+			// the final nodes for the current level.
+			// User6 as var(func: uid(User2), orderasc: ...) @filter((eq(User.username, "User1") AND (...Auth Filter))))
+			filtervarName := auth.varGen.Next(f.Type(), "", "", auth.isWritingAuth)
+			selectionQry := &gql.GraphQuery{
+				Var:  filtervarName,
+				Attr: "var",
+				Func: &gql.Function{
+					Name: "uid",
+					Args: []gql.Arg{{Value: parentQryName}},
+				},
+			}
+
+			addArgumentsToField(selectionQry, f)
+			selectionQry.Filter = child.Filter
+			authQueries = append(authQueries, parentQry, selectionQry)
+			child.Filter = &gql.FilterTree{
+				Func: &gql.Function{
+					Name: "uid",
+					Args: []gql.Arg{{Value: filtervarName}},
+				},
+			}
+
+			// We already apply the following to `selectionQry` by calling addArgumentsToField()
+			// hence they are no longer required.
+			child.Args = nil
+		}
+		authQueries = append(authQueries, selectionAuth...)
+		authQueries = append(authQueries, fieldAuth...)
 	}
 
 	// Sort the required fields before adding them to q.Children so that the query produced after
@@ -369,6 +830,8 @@ func addSelectionSetFrom(q *gql.GraphQuery, field schema.Field) {
 			q.Children = append(q.Children, child)
 		}
 	}
+
+	return authQueries
 }
 
 func addOrder(q *gql.GraphQuery, field schema.Field) {
@@ -405,6 +868,10 @@ func addPagination(q *gql.GraphQuery, field schema.Field) {
 	}
 }
 
+func addCascadeDirective(q *gql.GraphQuery, field schema.Field) {
+	q.Cascade = field.Cascade()
+}
+
 func convertIDs(idsSlice []interface{}) []uint64 {
 	ids := make([]uint64, 0, len(idsSlice))
 	for _, id := range idsSlice {
@@ -418,9 +885,13 @@ func convertIDs(idsSlice []interface{}) []uint64 {
 	return ids
 }
 
-func idFilter(field schema.Field, idField schema.FieldDefinition) []uint64 {
-	filter, ok := field.ArgValue("filter").(map[string]interface{})
-	if !ok || idField == nil {
+func extractQueryFilter(f schema.Field) map[string]interface{} {
+	filter, _ := f.ArgValue("filter").(map[string]interface{})
+	return filter
+}
+
+func idFilter(filter map[string]interface{}, idField schema.FieldDefinition) []uint64 {
+	if filter == nil || idField == nil {
 		return nil
 	}
 

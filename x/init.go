@@ -34,6 +34,7 @@ var (
 
 	// These variables are set using -ldflags
 	dgraphVersion  string
+	dgraphCodename string
 	gitBranch      string
 	lastCommitSHA  string
 	lastCommitTime string
@@ -74,23 +75,24 @@ func BuildDetails() string {
 		licenseInfo = "Licensed variously under the Apache Public License 2.0 and Dgraph " +
 			"Community License"
 	}
+
 	return fmt.Sprintf(`
 Dgraph version   : %v
+Dgraph codename  : %v
 Dgraph SHA-256   : %x
 Commit SHA-1     : %v
 Commit timestamp : %v
 Branch           : %v
 Go version       : %v
 
-For Dgraph official documentation, visit https://docs.dgraph.io.
+For Dgraph official documentation, visit https://dgraph.io/docs/.
 For discussions about Dgraph     , visit https://discuss.dgraph.io.
-To say hi to the community       , visit https://dgraph.slack.com.
 
 %s.
 Copyright 2015-2020 Dgraph Labs, Inc.
 
 `,
-		dgraphVersion, ExecutableChecksum(), lastCommitSHA, lastCommitTime, gitBranch,
+		dgraphVersion, dgraphCodename, ExecutableChecksum(), lastCommitSHA, lastCommitTime, gitBranch,
 		runtime.Version(), licenseInfo)
 }
 

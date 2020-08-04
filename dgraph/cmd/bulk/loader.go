@@ -27,6 +27,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -47,6 +48,7 @@ type options struct {
 	DataFiles        string
 	DataFormat       string
 	SchemaFile       string
+	GqlSchemaFile    string
 	OutDir           string
 	ReplaceOutDir    bool
 	TmpDir           string
@@ -71,8 +73,8 @@ type options struct {
 	shardOutputDirs []string
 
 	// ........... Badger options ..........
-	// BadgerKeyFile is the file containing the key used for encryption. Enterprise only feature.
-	BadgerKeyFile string
+	// EncryptionKey is the key used for encryption. Enterprise only feature.
+	EncryptionKey x.SensitiveByteSlice
 	// BadgerCompressionlevel is the compression level to use while writing to badger.
 	BadgerCompressionLevel int
 }
@@ -86,7 +88,8 @@ type state struct {
 	readerChunkCh chan *bytes.Buffer
 	mapFileId     uint32 // Used atomically to name the output files of the mappers.
 	dbs           []*badger.DB
-	writeTs       uint64 // All badger writes use this timestamp
+	tmpDbs        []*badger.DB // Temporary DB to write the split lists to avoid ordering issues.
+	writeTs       uint64       // All badger writes use this timestamp
 }
 
 type loader struct {
@@ -149,11 +152,11 @@ func readSchema(opt *options) *schema.ParsedSchema {
 	x.Check(err)
 	defer f.Close()
 
-	keyfile := opt.BadgerKeyFile
+	key := opt.EncryptionKey
 	if !opt.Encrypted {
-		keyfile = ""
+		key = nil
 	}
-	r, err := enc.GetReader(keyfile, f)
+	r, err := enc.GetReader(key, f)
 	x.Check(err)
 	if filepath.Ext(opt.SchemaFile) == ".gz" {
 		r, err = gzip.NewReader(r)
@@ -214,11 +217,11 @@ func (ld *loader) mapStage() {
 		go func(file string) {
 			defer thr.Done(nil)
 
-			keyfile := ld.opt.BadgerKeyFile
+			key := ld.opt.EncryptionKey
 			if !ld.opt.Encrypted {
-				keyfile = ""
+				key = nil
 			}
-			r, cleanup := chunker.FileReader(file, keyfile)
+			r, cleanup := chunker.FileReader(file, key)
 			defer cleanup()
 
 			chunk := chunker.NewChunker(loadType, 1000)
@@ -237,6 +240,9 @@ func (ld *loader) mapStage() {
 	}
 	x.Check(thr.Finish())
 
+	// Send the graphql triples
+	ld.processGqlSchema(loadType)
+
 	close(ld.readerChunkCh)
 	mapperWg.Wait()
 
@@ -249,6 +255,51 @@ func (ld *loader) mapStage() {
 		x.Check(db.Close())
 	}
 	ld.xids = nil
+}
+
+func (ld *loader) processGqlSchema(loadType chunker.InputFormat) {
+	if ld.opt.GqlSchemaFile == "" {
+		return
+	}
+
+	f, err := os.Open(ld.opt.GqlSchemaFile)
+	x.Check(err)
+	defer f.Close()
+
+	key := ld.opt.EncryptionKey
+	if !ld.opt.Encrypted {
+		key = nil
+	}
+	r, err := enc.GetReader(key, f)
+	x.Check(err)
+	if filepath.Ext(ld.opt.GqlSchemaFile) == ".gz" {
+		r, err = gzip.NewReader(r)
+		x.Check(err)
+	}
+
+	buf, err := ioutil.ReadAll(r)
+	x.Check(err)
+
+	rdfSchema := `_:gqlschema <dgraph.type> "dgraph.graphql" .
+	_:gqlschema <dgraph.graphql.xid> "dgraph.graphql.schema" .
+	_:gqlschema <dgraph.graphql.schema> %s .
+	`
+
+	jsonSchema := `{
+		"dgraph.type": "dgraph.graphql",
+		"dgraph.graphql.xid": "dgraph.graphql.schema",
+		"dgraph.graphql.schema": %s
+	}`
+
+	gqlBuf := &bytes.Buffer{}
+	schema := strconv.Quote(string(buf))
+	switch loadType {
+	case chunker.RdfFormat:
+		x.Check2(gqlBuf.Write([]byte(fmt.Sprintf(rdfSchema, schema))))
+	case chunker.JsonFormat:
+		x.Check2(gqlBuf.Write([]byte(fmt.Sprintf(jsonSchema, schema))))
+	}
+	ld.readerChunkCh <- gqlBuf
 }
 
 func (ld *loader) reduceStage() {
@@ -291,6 +342,9 @@ func (ld *loader) writeSchema() {
 
 func (ld *loader) cleanup() {
 	for _, db := range ld.dbs {
+		x.Check(db.Close())
+	}
+	for _, db := range ld.tmpDbs {
 		x.Check(db.Close())
 	}
 	ld.prog.endSummary()

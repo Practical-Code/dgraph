@@ -37,6 +37,8 @@ import (
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc/peer"
+
 	"github.com/dgraph-io/badger/v2"
 	"github.com/dgraph-io/badger/v2/y"
 	"github.com/dgraph-io/dgo/v200"
@@ -121,12 +123,19 @@ const (
 `
 
 	InitialTypes = `
-"types": [
-{"fields":[{"name":"dgraph.graphql.schema"},{"name":"dgraph.graphql.xid"}],"name":"dgraph.graphql"},
-{"fields": [{"name": "dgraph.password"},{"name": "dgraph.xid"},{"name": "dgraph.user.group"}],"name": "User"},
-{"fields": [{"name": "dgraph.acl.rule"},{"name": "dgraph.xid"}],"name": "Group"},
-{"fields": [{"name": "dgraph.rule.predicate"},{"name": "dgraph.rule.permission"}],"name": "Rule"}
-]`
+"types": [{
+	"fields": [{"name": "dgraph.graphql.schema"},{"name": "dgraph.graphql.xid"}],
+	"name": "dgraph.graphql"
+},{
+	"fields": [{"name": "dgraph.password"},{"name": "dgraph.xid"},{"name": "dgraph.user.group"}],
+	"name": "dgraph.type.User"
+},{
+	"fields": [{"name": "dgraph.acl.rule"},{"name": "dgraph.xid"}],
+	"name": "dgraph.type.Group"
+},{
+	"fields": [{"name": "dgraph.rule.predicate"},{"name": "dgraph.rule.permission"}],
+	"name": "dgraph.type.Rule"
+}]`
 
 	// GroupIdFileName is the name of the file storing the ID of the group to which
 	// the data in a postings directory belongs. This ID is used to join the proper
@@ -367,6 +376,58 @@ func AttachAccessJwt(ctx context.Context, r *http.Request) context.Context {
 		ctx = metadata.NewIncomingContext(ctx, md)
 	}
 	return ctx
+}
+
+// AttachRemoteIP adds any incoming IP data into the grpc context metadata
+func AttachRemoteIP(ctx context.Context, r *http.Request) context.Context {
+	if ip, port, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		if intPort, convErr := strconv.Atoi(port); convErr == nil {
+			ctx = peer.NewContext(ctx, &peer.Peer{
+				Addr: &net.TCPAddr{
+					IP:   net.ParseIP(ip),
+					Port: intPort,
+				},
+			})
+		}
+	}
+	return ctx
+}
+
+// isIpWhitelisted checks if the given ipString is within the whitelisted ip range
+func isIpWhitelisted(ipString string) bool {
+	ip := net.ParseIP(ipString)
+
+	if ip == nil {
+		return false
+	}
+
+	if ip.IsLoopback() {
+		return true
+	}
+
+	for _, ipRange := range WorkerConfig.WhiteListedIPRanges {
+		if bytes.Compare(ip, ipRange.Lower) >= 0 && bytes.Compare(ip, ipRange.Upper) <= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// HasWhitelistedIP checks whether the source IP in ctx is whitelisted or not.
+// It returns the IP address if the IP is whitelisted, otherwise an error is returned.
+func HasWhitelistedIP(ctx context.Context) (net.Addr, error) {
+	peerInfo, ok := peer.FromContext(ctx)
+	if !ok {
+		return nil, errors.New("unable to find source ip")
+	}
+	ip, _, err := net.SplitHostPort(peerInfo.Addr.String())
+	if err != nil {
+		return nil, err
+	}
+	if !isIpWhitelisted(ip) {
+		return nil, errors.Errorf("unauthorized ip address: %s", ip)
+	}
+	return peerInfo.Addr, nil
 }
 
 // Write response body, transparently compressing if necessary.
@@ -679,7 +740,7 @@ func DivideAndRule(num int) (numGo, width int) {
 }
 
 // SetupConnection starts a secure gRPC connection to the given host.
-func SetupConnection(host string, tlsCfg *tls.Config, useGz bool) (*grpc.ClientConn, error) {
+func SetupConnection(host string, tlsCfg *tls.Config, useGz bool, dialOpts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	callOpts := append([]grpc.CallOption{},
 		grpc.MaxCallRecvMsgSize(GrpcMaxSize),
 		grpc.MaxCallSendMsgSize(GrpcMaxSize))
@@ -689,7 +750,7 @@ func SetupConnection(host string, tlsCfg *tls.Config, useGz bool) (*grpc.ClientC
 		callOpts = append(callOpts, grpc.UseCompressor(gzip.Name))
 	}
 
-	dialOpts := append([]grpc.DialOption{},
+	dialOpts = append(dialOpts,
 		grpc.WithStatsHandler(&ocgrpc.ClientHandler{}),
 		grpc.WithDefaultCallOptions(callOpts...),
 		grpc.WithBlock())
@@ -754,13 +815,38 @@ type CredOpt struct {
 	PasswordOpt string
 }
 
+type authorizationCredentials struct {
+	token string
+}
+
+func (a *authorizationCredentials) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	return map[string]string{"Authorization": a.token}, nil
+}
+
+func (a *authorizationCredentials) RequireTransportSecurity() bool {
+	return true
+}
+
+// WithAuthorizationCredentials adds Authorization: <api-token> to every GRPC request
+// This is mostly used by Slash GraphQL to authenticate requests
+func WithAuthorizationCredentials(authToken string) grpc.DialOption {
+	return grpc.WithPerRPCCredentials(&authorizationCredentials{authToken})
+}
+
 // GetDgraphClient creates a Dgraph client based on the following options in the configuration:
+// --slash_grpc_endpoint specifies the grpc endpoint for slash. It takes precedence over --alpha and TLS
 // --alpha specifies a comma separated list of endpoints to connect to
 // --tls_cacert, --tls_cert, --tls_key etc specify the TLS configuration of the connection
 // --retries specifies how many times we should retry the connection to each endpoint upon failures
 // --user and --password specify the credentials we should use to login with the server
 func GetDgraphClient(conf *viper.Viper, login bool) (*dgo.Dgraph, CloseFunc) {
-	alphas := conf.GetString("alpha")
+	var alphas string
+	if conf.GetString("slash_grpc_endpoint") != "" {
+		alphas = conf.GetString("slash_grpc_endpoint")
+	} else {
+		alphas = conf.GetString("alpha")
+	}
+
 	if len(alphas) == 0 {
 		glog.Fatalf("The --alpha option must be set in order to connect to Dgraph")
 	}
@@ -781,10 +867,15 @@ func GetDgraphClient(conf *viper.Viper, login bool) (*dgo.Dgraph, CloseFunc) {
 		}
 	}
 
+	dialOpts := []grpc.DialOption{}
+	if conf.GetString("slash_grpc_endpoint") != "" && conf.IsSet("auth_token") {
+		dialOpts = append(dialOpts, WithAuthorizationCredentials(conf.GetString("auth_token")))
+	}
+
 	for _, d := range ds {
 		var conn *grpc.ClientConn
 		for i := 0; i < retries; i++ {
-			conn, err = SetupConnection(d, tlsCfg, false)
+			conn, err = SetupConnection(d, tlsCfg, false, dialOpts...)
 			if err == nil {
 				break
 			}
@@ -936,4 +1027,48 @@ func StoreSync(db DB, closer *y.Closer) {
 			return
 		}
 	}
+}
+
+// DeepCopyJsonMap returns a deep copy of the input map `m`.
+// `m` is supposed to be a map similar to the ones produced as a result of json unmarshalling. i.e.,
+// any value in `m` at any nested level should be of an inbuilt go type.
+func DeepCopyJsonMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+
+	mCopy := make(map[string]interface{})
+	for k, v := range m {
+		switch val := v.(type) {
+		case map[string]interface{}:
+			mCopy[k] = DeepCopyJsonMap(val)
+		case []interface{}:
+			mCopy[k] = DeepCopyJsonArray(val)
+		default:
+			mCopy[k] = val
+		}
+	}
+	return mCopy
+}
+
+// DeepCopyJsonArray returns a deep copy of the input array `a`.
+// `a` is supposed to be an array similar to the ones produced as a result of json unmarshalling.
+// i.e., any value in `a` at any nested level should be of an inbuilt go type.
+func DeepCopyJsonArray(a []interface{}) []interface{} {
+	if a == nil {
+		return nil
+	}
+
+	aCopy := make([]interface{}, 0, len(a))
+	for _, v := range a {
+		switch val := v.(type) {
+		case map[string]interface{}:
+			aCopy = append(aCopy, DeepCopyJsonMap(val))
+		case []interface{}:
+			aCopy = append(aCopy, DeepCopyJsonArray(val))
+		default:
+			aCopy = append(aCopy, val)
+		}
+	}
+	return aCopy
 }

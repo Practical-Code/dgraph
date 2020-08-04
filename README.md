@@ -1,25 +1,27 @@
 ![](/logo.png)
 
-**Fast, Transactional, Distributed Graph Database.**
+**The Only Native GraphQL Database With A Graph Backend.**
 
-[![Wiki](https://img.shields.io/badge/res-wiki-blue.svg)](https://docs.dgraph.io)
+[![Wiki](https://img.shields.io/badge/res-wiki-blue.svg)](https://dgraph.io/docs/)
 [![Build Status](https://teamcity.dgraph.io/guestAuth/app/rest/builds/buildType:(id:Dgraph_Ci)/statusIcon.svg)](https://teamcity.dgraph.io/viewLog.html?buildTypeId=Dgraph_Ci&buildId=lastFinished&guest=1)
 [![Coverage Status](https://coveralls.io/repos/github/dgraph-io/dgraph/badge.svg?branch=master)](https://coveralls.io/github/dgraph-io/dgraph?branch=master)
 [![Go Report Card](https://goreportcard.com/badge/github.com/dgraph-io/dgraph)](https://goreportcard.com/report/github.com/dgraph-io/dgraph)
 
-Dgraph is a horizontally scalable and distributed graph database, providing ACID transactions, consistent replication and linearizable reads. It's built from ground up to perform for
-a rich set of queries. Being a native graph database, it tightly controls how the
+Dgraph is a horizontally scalable and distributed GraphQL database with a graph backend. It provides ACID transactions, consistent replication and linearizable reads. It's built from ground up to perform for
+a rich set of queries. Being a native GraphQL database, it tightly controls how the
 data is arranged on disk to optimize for query performance and throughput,
 reducing disk seeks and network calls in a cluster.
 
 
 Dgraph's goal is to provide [Google](https://www.google.com) production level scale and throughput,
 with low enough latency to be serving real time user queries, over terabytes of structured data.
-Dgraph supports [GraphQL-like query syntax](https://docs.dgraph.io/master/query-language/), and responds in [JSON](http://www.json.org/) and [Protocol Buffers](https://developers.google.com/protocol-buffers/) over [GRPC](http://www.grpc.io/) and HTTP.
+Dgraph supports [GraphQL query syntax](https://dgraph.io/docs/master/query-language/), and responds in [JSON](http://www.json.org/) and [Protocol Buffers](https://developers.google.com/protocol-buffers/) over [GRPC](http://www.grpc.io/) and HTTP.
+
+**Use [Discuss Issues](https://discuss.dgraph.io/c/issues/dgraph/38) for reporting issues about this repository.**
 
 ## Status
 
-Dgraph is [at version 1.1.x][rel] and is production ready. Apart from the vast open source community, it is being used in
+Dgraph is [at version 20.03.4][rel] and is production ready. Apart from the vast open source community, it is being used in
 production at multiple Fortune 500 companies, and by
 [Intuit Katlas](https://github.com/intuit/katlas) and [VMware Purser](https://github.com/vmware/purser).
 
@@ -63,8 +65,8 @@ make install
 ## Get Started
 **To get started with Dgraph, follow:**
 
-- Installation to queries in 3 steps via [docs.dgraph.io](https://docs.dgraph.io/get-started/).
-- A longer interactive tutorial via [tour.dgraph.io](https://tour.dgraph.io).
+- Installation to queries in 3 steps via [dgraph.io/docs/](https://dgraph.io/docs/get-started/).
+- A longer interactive tutorial via [dgraph.io/tour/](https://dgraph.io/tour/).
 - Tutorial and
 presentation videos on [YouTube channel](https://www.youtube.com/channel/UCghE41LR8nkKFlR3IFTRO4w/featured).
 
@@ -98,7 +100,7 @@ makes it easy to build applications with it.
 | License | Apache 2.0 | GPL v3 | Apache 2.0 |
 
 ## Users
-- **Dgraph official documentation is present at [docs.dgraph.io](https://docs.dgraph.io).**
+- **Dgraph official documentation is present at [dgraph.io/docs/](https://dgraph.io/docs/).**
 - For feature requests or questions, visit
   [https://discuss.dgraph.io](https://discuss.dgraph.io).
 - Check out [the demo at dgraph.io](http://dgraph.io) and [the visualization at
@@ -117,7 +119,7 @@ makes it easy to build applications with it.
 - Please see [Contributing to Dgraph](https://github.com/dgraph-io/dgraph/blob/master/CONTRIBUTING.md) for guidelines on contributions.
 
 ## Client Libraries
-The Dgraph team maintain a number of [officially supported client libraries](https://docs.dgraph.io/clients/). There are also libraries contributed by the community [unofficial client libraries](https://docs.dgraph.io/clients#unofficial-dgraph-clients).
+The Dgraph team maintain a number of [officially supported client libraries](https://dgraph.io/docs/clients/). There are also libraries contributed by the community [unofficial client libraries](https://dgraph.io/docs/clients#unofficial-dgraph-clients).
 
 ## Contact
 - Please use [discuss.dgraph.io](https://discuss.dgraph.io) for documentation, questions, feature requests and discussions.

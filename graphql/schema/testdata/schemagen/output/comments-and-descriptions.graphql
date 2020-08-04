@@ -45,6 +45,13 @@ enum DgraphIndex {
 	hour
 }
 
+input AuthRule {
+	and: [AuthRule]
+	or: [AuthRule]
+	not: AuthRule
+	rule: String
+}
+
 enum HTTPMethod {
 	GET
 	POST
@@ -53,25 +60,37 @@ enum HTTPMethod {
 	DELETE
 }
 
+enum Mode {
+	BATCH
+	SINGLE
+}
+
 input CustomHTTP {
 	url: String!
 	method: HTTPMethod!
-	body: String!
+	body: String
+	graphql: String
+	mode: Mode
 	forwardHeaders: [String!]
-}
-
-input CustomGraphQL {
-	query: String!
+	secretHeaders: [String!]
+	introspectionHeaders: [String!]
+	skipIntrospection: Boolean
 }
 
 directive @hasInverse(field: String!) on FIELD_DEFINITION
 directive @search(by: [DgraphIndex!]) on FIELD_DEFINITION
 directive @dgraph(type: String, pred: String) on OBJECT | INTERFACE | FIELD_DEFINITION
 directive @id on FIELD_DEFINITION
+directive @withSubscription on OBJECT | INTERFACE
 directive @secret(field: String!, pred: String) on OBJECT | INTERFACE
-directive @custom(http: CustomHTTP, graphql: CustomGraphQL) on FIELD_DEFINITION
+directive @auth(
+	query: AuthRule,
+	add: AuthRule,
+	update: AuthRule,
+	delete:AuthRule) on OBJECT
+directive @custom(http: CustomHTTP, dql: String) on FIELD_DEFINITION
 directive @remote on OBJECT | INTERFACE
-
+directive @cascade on FIELD
 
 input IntFilter {
 	eq: Int
@@ -133,6 +152,7 @@ type AddTPayload {
 }
 
 type DeleteTPayload {
+	t(filter: TFilter, order: TOrder, first: Int, offset: Int): [T]
 	msg: String
 	numUids: Int
 }
@@ -221,12 +241,3 @@ type Mutation {
 	deleteT(filter: TFilter!): DeleteTPayload
 }
 
-#######################
-# Generated Subscriptions
-#######################
-
-type Subscription {
-	queryI(order: IOrder, first: Int, offset: Int): [I]
-	getT(id: ID!): T
-	queryT(filter: TFilter, order: TOrder, first: Int, offset: Int): [T]
-}
